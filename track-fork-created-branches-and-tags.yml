@@ -1,0 +1,105 @@
+name: Track Fork-Created Branches and Tags
+
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - '**'
+
+env:
+  METADATA_DIR: .github/sync-metadata
+
+jobs:
+  track:
+    runs-on: ubuntu-latest
+    if: github.repository_owner == github.actor
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Detect Ref Type and Name
+        id: detect
+        run: |
+          if [[ "${GITHUB_REF}" == refs/heads/* ]]; then
+            echo "ref_type=branch" >> "$GITHUB_OUTPUT"
+            echo "ref_name=${GITHUB_REF#refs/heads/}" >> "$GITHUB_OUTPUT"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "ref_type=tag" >> "$GITHUB_OUTPUT"
+            echo "ref_name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref_type=unknown" >> "$GITHUB_OUTPUT"
+            echo "ref_name=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ensure Metadata Directory Exists
+        run: |
+          set -euo pipefail
+
+          if [[ ! -d "$METADATA_DIR" ]]; then
+            echo "Metadata directory does not exist. Creating $METADATA_DIR..."
+            mkdir -p "$METADATA_DIR"
+          else
+            echo "Metadata directory already exists: $METADATA_DIR."
+          fi
+
+      - name: Update Tracking Files
+        env:
+          REF_TYPE: ${{ steps.detect.outputs.ref_type }}
+          REF_NAME: ${{ steps.detect.outputs.ref_name }}
+        run: |
+          if [[ "$REF_TYPE" == "unknown" ]]; then
+            echo "Unsupported ref type: $GITHUB_REF"
+            exit 0
+          fi
+
+          if [[ "$REF_TYPE" == "branch" ]]; then
+            FILE="$METADATA_DIR/fork-created-branches.txt"
+            touch "$FILE"
+            if ! grep -Fxq "$REF_NAME" "$FILE"; then
+              echo "$REF_NAME" >> "$FILE"
+              echo "added=true" >> "$GITHUB_ENV"
+            else
+              echo "Ref name already recorded."
+              echo "added=false" >> "$GITHUB_ENV"
+            fi
+          elif [[ "$REF_TYPE" == "tag" ]]; then
+            FILE="$METADATA_DIR/fork-created-tags.txt"
+            touch "$FILE"
+            TAG_COMMIT=$(git rev-list -n 1 "$REF_NAME")
+            SOURCE_BRANCH=$(git branch --contains "$TAG_COMMIT" | grep -v 'remotes/' | sed 's/^[* ]*//;q')
+            if [[ -z "$SOURCE_BRANCH" ]]; then
+              SOURCE_BRANCH=$(git branch -r --contains "$TAG_COMMIT" | grep -v 'HEAD' | sed 's/^[* ]*//;q')
+              if [[ -z "$SOURCE_BRANCH" ]]; then
+                SOURCE_BRANCH="unknown"
+              fi
+            fi
+                SOURCE_BRANCH="unknown"
+              fi
+            fi
+            if [[ -z "$SOURCE_BRANCH" ]]; then
+              SOURCE_BRANCH="unknown"
+            fi
+            # Format: tag | source_branch | commit | date | author
+            TAG_DATE=$(git show -s --format=%ci "$TAG_COMMIT")
+            TAG_AUTHOR=$(git show -s --format='%an <%ae>' "$TAG_COMMIT")
+            ENTRY="$REF_NAME | $SOURCE_BRANCH | $TAG_COMMIT | $TAG_DATE | $TAG_AUTHOR"
+            if ! grep -Fxq "$ENTRY" "$FILE"; then
+              echo "$ENTRY" >> "$FILE"
+              echo "added=true" >> "$GITHUB_ENV"
+            else
+              echo "Tag entry already recorded."
+              echo "added=false" >> "$GITHUB_ENV"
+            fi
+          fi
+
+      - name: Commit and Push New Ref
+        if: env.added == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add .github/sync-metadata/fork-created-*.txt
+          git commit -m "chore: Track fork-created ${{ steps.detect.outputs.ref_type }}: ${{ steps.detect.outputs.ref_name }}"
+          git push
