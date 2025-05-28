@@ -1,0 +1,202 @@
+name: Sync Repo
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+env:
+  WORKFLOW_DIR: .github/workflows/
+  METADATA_DIR: .github/sync-metadata/
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  collect-metadata:
+    name: Collect Repository Metadata
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      upstream_full_name: ${{ steps.collect-repo-metadata.outputs.UPSTREAM_FULL_NAME }}
+      upstream_url: ${{ steps.collect-repo-metadata.outputs.UPSTREAM_URL }}
+      upstream_default_branch: ${{ steps.collect-repo-metadata.outputs.UPSTREAM_DEFAULT_BRANCH }}
+    steps:
+      - name: Collect Upstream and Origin Repository Metadata
+        id: collect-repo-metadata
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          echo "Fetching repository metadata via Github API..."
+          response=$(curl -sf -H "Authorization: token $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}")
+
+          if echo "$response" | jq -e '.fork == true'; then
+            echo "This repository is a fork. Fetching metadata..."
+            echo "UPSTREAM_FULL_NAME=$(echo "$response" | jq -re '.parent.full_name')" >> "$GITHUB_OUTPUT"
+            echo "UPSTREAM_URL=$(echo "$response" | jq -r '.parent.clone_url')" >> "$GITHUB_OUTPUT"
+            echo "UPSTREAM_DEFAULT_BRANCH=$(echo "$response" | jq -re '.parent.default_branch')" >> "$GITHUB_OUTPUT"
+          else
+            echo "This repository is not a fork."
+          fi
+
+  sync-fork:
+    name: Sync Forked Repository
+    runs-on: ubuntu-latest
+    needs: [collect-metadata]
+    permissions:
+      contents: write
+    env:
+      FORK_BRANCHES_FILE: ${{ env.METADATA_DIR }}/fork-created-branches.txt
+      FORK_TAGS_FILE: ${{ env.METADATA_DIR }}/fork-created-tags.json
+    outputs:
+      origin_tags: ${{ steps.sync-branches-and-tags.outputs.ORIGIN_TAGS }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git and Upstream Remote
+        env:
+          UPSTREAM_URL: ${{ needs.collect-metadata.outputs.upstream_url }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if ! git remote get-url upstream &> /dev/null; then
+            git remote add upstream "$UPSTREAM_URL"
+          else
+            git remote set-url upstream "$UPSTREAM_URL"
+          fi
+
+      - name: Sync Branches and Tags
+        id: sync-branches-and-tags
+        env:
+          UPSTREAM_DEFAULT_BRANCH: ${{ needs.collect-metadata.outputs.upstream_default_branch }}
+          UPSTREAM_BRANCHES: ${{ needs.collect-metadata.outputs.upstream_branches }}
+          ORIGIN_BRANCHES: ${{ needs.collect-metadata.outputs.origin_branches }}
+        run: |
+          set -euo pipefail
+
+          git fetch upstream --tags
+          git fetch origin --tags
+
+          # Prune and Sync Branches
+          mapfile -t upstream_branches < <(git for-each-ref --format='%(refname:strip=3)' refs/remotes/upstream/)
+          mapfile -t origin_branches < <(git for-each-ref --format='%(refname:strip=3)' refs/remotes/origin/)
+
+          if [[ -s "$FORK_BRANCHES_FILE" ]]; then
+            mapfile -t fork_branches < "$FORK_BRANCHES_FILE"
+          else
+            fork_branches=()
+          fi
+
+          is_fork_created_branch() {
+            local branch=$1
+            for fork_branch in "${fork_branches[@]}"; do
+              [[ -z "$fork_branch" ]] && continue
+              [[ "$branch" == "$fork_branch" ]] && return 0
+            done
+            return 1
+          }
+
+          echo "Detecting upstream-deleted branches to prune..."
+          for origin_branch in "${origin_branches[@]}"; do
+            if ! echo "$upstream_branches" | grep -Fxq "$origin_branch"; then
+              if is_fork_created_branch "$origin_branch"; then
+                echo "Skipping fork-created branch $origin_branch..."
+              else
+                echo "Pruning upstream-deleted branch $origin_branch from origin..."
+                git push origin --delete "$origin_branch"
+              fi
+            fi
+          done
+
+          git sparse-checkout set --no-cone --stdin <<"EOF"
+          /*
+          !$WORKFLOW_DIR
+          !$METADATA_DIR
+          EOF
+
+          echo "Syncing branches from upstream..."
+          conflicts=()
+          for upstream_branch in "${upstream_branches[@]}"; do
+            if is_fork_created_branch "$upstream_branch"; then
+              echo "Conflict detected: Branch '$upstream_branch' exists in both upstream and fork-created branches!"
+              conflicts+=("$upstream_branch")
+            fi
+          done
+
+          if [ ${#conflicts[@]} -gt 0 ]; then
+            echo "Sync halted due to branch name conflicts!"
+            echo "The following branches exist in both upstream and fork-created branches:"
+            printf '%s\n' "${conflicts[@]}"
+            echo "Please resolve these conflicts manually and update the fork-created-branches.txt file accordingly."
+            exit 1
+          fi
+
+          for upstream_branch in "${upstream_branches[@]}"; do
+            echo "Syncing upstream branch: $upstream_branch..."
+            git checkout "$upstream_branch" || git checkout -b "$upstream_branch"
+            git reset --hard "upstream/$upstream_branch"
+            git push --force origin "$upstream_branch"
+          done
+          
+          # Prune and Sync Tags
+          mapfile -t upstream_tags < <(git tag -l --sort=creatordate)
+          mapfile -t origin_tags < <(git tag -l --sort=creatordate)
+
+          if [[ -s "$FORK_TAGS_FILE" ]]; then
+            mapfile -t fork_tags < <(jq -r '.[].name' "$FORK_TAGS_FILE")
+          else
+            fork_tags=()
+          fi
+          
+          is_fork_created_tag() {
+            local tag=$1
+            for fork_tag in "${fork_tags[@]}"; do
+              [[ -z "$fork_tag" ]] && continue
+              [[ "$tag" == "$fork_tag" ]] && return 0
+            done
+            return 1
+          }
+
+          echo "Pruning upstream-deleted tags from origin..."
+          for origin_tag in "${origin_tags[@]}"; do
+            if ! printf '%s\n' "${upstream_tags[@]}" | grep -Fxq "$origin_tag"; then
+              if is_fork_created_tag "$origin_tag"; then
+                echo "Skipping fork-created tag $origin_tag..."
+              else
+                echo "Deleting tag $origin_tag from origin..."
+                git push origin --delete "refs/tags/$origin_tag"
+              fi
+            fi
+          done
+          
+          echo "Syncing new tags from upstream to origin..."
+          for upstream_tag in "${upstream_tags[@]}"; do
+            if ! printf '%s\n' "${origin_tags[@]}" | grep -Fxq "$upstream_tag"; then
+              echo "Pushing upstream tag $upstream_tag to origin..."
+              git push origin "$upstream_tag"
+            fi
+          done
+          
+          echo "ORIGIN_TAGS=$(git tag -l --sort=creatordate | jq -Rcs .)" >> "$GITHUB_OUTPUT"
+
+  build-and-push-images:
+    name: Build & Push Images to Registries
+    needs: [collect-metadata, sync-fork]
+    strategy:
+      matrix:
+        registry: [ghcr, dockerhub]
+    uses: ./.github/workflows/build-and-push-docker-images.yml
+    with:
+      origin_tags: ${{ needs.sync-fork.outputs.origin_tags }}
+      registry: ${{ matrix.registry }}
+      upstream_full_name: ${{ needs.collect-metadata.outputs.upstream_full_name }}
