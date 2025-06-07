@@ -10,12 +10,16 @@ on:
 env:
   METADATA_DIR: .github/sync-metadata
 
+concurrency:
+  group: track-fork-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   track:
     runs-on: ubuntu-latest
     env:
-      FORK_BRANCHES_FILE: ${{ env.METADATA_DIR }}/fork-created-branches.txt
-      FORK_TAGS_FILE: ${{ env.METADATA_DIR }}/fork-created-tags.json
+      FORK_BRANCHES_FILE: $METADATA_DIR/fork-created-branches.txt
+      FORK_TAGS_FILE: $METADATA_DIR/fork-created-tags.json
     if: github.actor == github.repository_owner
     steps:
       - name: Checkout repository
@@ -49,6 +53,7 @@ jobs:
           fi
 
       - name: Update Tracking Files
+        id: update-tracking
         env:
           REF_TYPE: ${{ steps.detect-ref.outputs.ref_type }}
           REF_NAME: ${{ steps.detect-ref.outputs.ref_name }}
@@ -91,17 +96,17 @@ jobs:
                   echo "added=true" >> "$GITHUB_ENV"
                 else
                   echo "Tag entry already recorded."
-                  echo "added=false" >> "$GITHUB_ENV"
+                  echo "added=false" >> "$GITHUB_OUTPUT"
                 fi
               else
                 echo "Tag is not on a fork-created branch, skipping..."
-                echo "added=false" >> "$GITHUB_ENV"
+                echo "added=false" >> "$GITHUB_OUTPUT"
               fi
               ;;
           esac
 
       - name: Commit and Push New Ref
-        if: env.added == 'true'
+        if: ${{ steps.update-tracking.outputs.added == 'true' }}
         run: |
           set -euo pipefail
 

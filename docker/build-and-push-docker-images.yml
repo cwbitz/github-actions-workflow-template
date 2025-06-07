@@ -24,11 +24,11 @@ jobs:
       buildx_platforms: ${{ steps.detect-platforms.outputs.BUILDX_PLATFORMS }}
       upstream_license: ${{ steps.collect-upstream-metadata.outputs.UPSTREAM_LICENSE }}
       upstream_contributors: ${{ steps.collect-upstream-metadata.outputs.UPSTREAM_CONTRIBUTORS }}
-      ghcr_url_base: ${{ steps.check-registry.outputs.GHCR_URL_BASE }}
+      ghcr_api_prefix: ${{ steps.check-registry.outputs.GHCR_API_PREFIX }}
       ghcr_repo_exists: ${{ steps.check-registry.outputs.GHCR_REPO_EXISTS }}
       dh_repo_exists: ${{ steps.check-registry.outputs.DH_REPO_EXISTS }}
-      tags_to_build: ${{ steps.analyze-tags.outputs.TAGS_TO_BUILD }}
-      tags_to_delete: ${{ steps.analyze-tags.outputs.TAGS_TO_DELETE }}
+      versions_to_build: ${{ steps.analyze-tags.outputs.VERSIONS_TO_BUILD }}
+      versions_to_delete: ${{ steps.analyze-tags.outputs.VERSIONS_TO_DELETE }}
     steps:
       - name: Set Up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -46,7 +46,7 @@ jobs:
             docker buildx inspect \
             | grep "Platforms:" \
             | sed 's/Platforms: //g' \
-            | jq -R 'split(",") | map(trim)'
+            | jq -R 'split(",") | map(ltrimstr(" ") | rtrimstr(" "))'
           )
           
           if [[ "$platforms" == "[]" ]]; then
@@ -54,7 +54,7 @@ jobs:
             exit 1
           fi
 
-          echo "Detected supported buildx platforms: $platforms_json"
+          echo "Detected supported buildx platforms: $platforms"
           echo "BUILDX_PLATFORMS=$platforms" >> "$GITHUB_OUTPUT"
 
       - name: Collect Upstream Metadata
@@ -95,20 +95,18 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Check GHCR repository existence
-          if [[ "${{ inputs.registry }}" == "ghcr" ]]; then
-            # Detect if the GHCR repository belongs to a user or organization
-            ghcr_owner_type=$(
-              curl -sf "https://api.github.com/repos/${{ github.repository }}" \
-              | jq -re '.owner.type'
-            )
+          case "${{ inputs.registry }}" in
+          "ghcr")
+            ghcr_response=$(gh api "repos/${{ github.repository }}")
+            ghcr_owner_type=$(echo "$ghcr_response" | jq -re '.owner.type' | tr '[:upper:]' '[:lower:]')
+            ghcr_owner_login=$(echo "$ghcr_response" | jq -re '.owner.login')
 
-            case "${ghcr_owner_type,,}" in
+            case "$ghcr_owner_type" in
               organization)
-                ghcr_url_base="https://api.github.com/orgs/${{ github.repository_owner }}"
+                ghcr_api_prefix="/orgs/$ghcr_owner_login"
                 ;;
               user)
-                ghcr_url_base="https://api.github.com/users/${{ github.repository_owner }}"
+                ghcr_api_prefix="/users/$ghcr_owner_login"
                 ;;
               *)
                 echo "Error: Unsupported owner type '$ghcr_owner_type'" >&2
@@ -116,30 +114,42 @@ jobs:
                 ;;
             esac
 
-            echo "GHCR_URL_BASE=$ghcr_url_base" >> "GITHUB_OUTPUT"
+            echo "GHCR_API_PREFIX=$ghcr_api_prefix" >> "$GITHUB_OUTPUT"
 
-            ghcr_http_code=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" -o /dev/null -w "%{http_code}" "$ghcr_url_base/packages/container/${{ github.event.repository.name }}")
-
-            if [[ "$ghcr_http_code" == "200" ]]; then
+            ghcr_repo_id=$(gh api -X GET "$ghcr_api_prefix/packages/container/${{ github.event.repository.name }}" --silent --jq '.id' || true)
+            if [[ -n "$ghcr_repo_id" ]]; then
               echo "GHCR repository exists"
               echo "GHCR_REPO_EXISTS=true" >> "$GITHUB_OUTPUT"
-            else 
+            else
               echo "GHCR repository does not exist yet"
               echo "GHCR_REPO_EXISTS=false" >> "$GITHUB_OUTPUT"
             fi
-          
-          # Check Docker Hub repository existence
-          elif [[ "${{ inputs.registry }}" == "dockerhub" ]]; then
-            dh_http_code=$(curl -sf -o /dev/null -w "%{http_code}" "https://hub.docker.com/v2/repositories/${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}")
-            
-            if [[ "$dh_http_code" == "200" ]]; then
+            ;;
+          "dockerhub")
+            repo_exists=false
+            next_url="https://hub.docker.com/v2/repositories/${{ secrets.DOCKERHUB_USERNAME }}/?page_size=100"
+            while [[ -n "$next_url" ]]; do
+              dh_response=$(curl -sf "$next_url")
+              if echo "$dh_response" | jq -e --arg repo "${{ github.event.repository.name }}" '.results[] | select(.name == $repo)' > /dev/null; then
+                repo_exists=true
+                break
+              fi
+              next_url=$(echo "$dh_response" | jq -r '.next // empty')
+            done
+
+            if [[ "$repo_exists" == "true" ]]; then
               echo "Docker Hub repository exists"
               echo "DH_REPO_EXISTS=true" >> "$GITHUB_OUTPUT"
             else
               echo "Docker Hub repository does not exist yet"
               echo "DH_REPO_EXISTS=false" >> "$GITHUB_OUTPUT"
             fi
-          fi
+            ;;
+          *)
+            echo "Error: Unsupported registry '${{ inputs.registry }}'"
+            exit 1
+            ;;
+          esac
 
       - name: Analyze Registry Tags
         id: analyze-tags
@@ -148,62 +158,62 @@ jobs:
           ORIGIN_TAGS: ${{ inputs.origin_tags }}
         run: |
           set -euo pipefail
-          
-          mapfile -t origin_tags < <(echo "$ORIGIN_TAGS" | jq -r '.[]')
+
+          mapfile -t origin_tags < <(echo "$ORIGIN_TAGS" | jq -re '.[]')
           echo "Found ${#origin_tags[@]} tags in Github repository"
 
-          registry_tags=()
+          VERSIONS_TO_BUILD=()
+          VERSIONS_TO_DELETE=()
 
           case "${{ inputs.registry }}" in
             "ghcr")
-              echo "Fetching tags from GHCR..."
-              page=1
-              while :; do
-                response=$(curl -sf -H "Authorization: Bearer $GH_TOKEN" \
-                  "${{ needs.pre-build.outputs.ghcr_url_base }}/packages/container/${{ github.event.repository.name }}/versions?per_page=100&page=$page")
-                
-                mapfile -t page_tags < <(echo "$response" | jq -r '.[].metadata.container.tags[]? // empty')
-                [[ ${#page_tags[@]} -eq 0 ]] && break
-                
-                registry_tags+=("${page_tags[@]}")
-                ((page++))
+              echo "Analyzing GHCR tags..."
+              versions=$(gh api --paginate "$GHCR_API_PREFIX/packages/container/${{ github.event.repository.name }}/versions?per_page=100")
+              mapfile -t ghcr_tags < <(echo "$versions" | jq -re '.[] | .metadata.container.tags[]?' | grep -E '^(v)?[0-9]+\.[0-9]+\.[0-9]+$')
+
+              for tag in "${origin_tags[@]}"; do
+                if ! printf '%s\n' "${ghcr_tags[@]}" | grep -Fxq "$tag"; then
+                  VERSIONS_TO_BUILD+=("$tag")
+                fi
+              done
+
+              for tag in "${ghcr_tags[@]}"; do
+                if ! printf '%s\n' "${origin_tags[@]}" | grep -Fxq "$tag"; then
+                  VERSIONS_TO_DELETE+=("$tag")
+                fi
               done
               ;;
-
             "dockerhub")
-              echo "Fetching tags from Docker Hub..."
+              echo "Analyzing Docker Hub tags..."
+              dh_tags=()
               next_url="https://hub.docker.com/v2/repositories/${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}/tags?page_size=100"
-              
               while [[ -n "$next_url" ]]; do
-                response=$(curl -sf "$next_url")
-                mapfile -t page_tags < <(echo "$response" | jq -r '.results[].name // empty')
-                registry_tags+=("${page_tags[@]}")
-                next_url=$(echo "$response" | jq -r '.next // empty')
+                dh_response=$(curl -sf "$next_url")
+                mapfile -t batch_tags < <(echo "$dh_response" | jq -re '.results[].name // empty' | grep -E '^(v)?[0-9]+\.[0-9]+\.[0-9]+$')
+                dh_tags+=("${batch_tags[@]}")
+                next_url=$(echo "$dh_response" | jq -r '.next // empty')
               done
+
+              for tag in "${origin_tags[@]}"; do
+                if ! printf '%s\n' "${dh_tags[@]}" | grep -Fxq "$tag"; then
+                  VERSIONS_TO_BUILD+=("$tag")
+                fi
+              done
+
+              for tag in "${dh_tags[@]}"; do
+                if ! printf '%s\n' "${origin_tags[@]}" | grep -Fxq "$tag"; then
+                  VERSIONS_TO_DELETE+=("$tag")
+                fi
+              done
+              ;;
+            *)
+              echo "Error: Unsupported registry '${{ inputs.registry }}'"
+              exit 1
               ;;
           esac
 
-          echo "Found ${#registry_tags[@]} tags in ${{ inputs.registry }} registry"
-
-          tags_to_build=()
-          tags_to_delete=()
-
-          for tag in "${origin_tags[@]}"; do
-            if ! printf '%s\n' "${registry_tags[@]}" | grep -Fxq "$tag"; then
-              echo "Found new tag to build: $tag"
-              tags_to_build+=("$tag")
-            fi
-          done
-
-          for tag in "${registry_tags[@]}"; do
-            if ! printf '%s\n' "${origin_tags[@]}" | grep -Fxq "$tag"; then
-              echo "Found outdated tag to delete: $tag"
-              tags_to_delete+=("$tag")
-            fi
-          done
-
-          echo "TAGS_TO_BUILD=$(printf '%s\n' "${tags_to_build[@]}" | jq -Rcs .)" >> "$GITHUB_OUTPUT"
-          echo "TAGS_TO_DELETE=$(printf '%s\n' "${tags_to_delete[@]}" | jq -Rcs .)" >> "$GITHUB_OUTPUT"
+          echo "VERSIONS_TO_BUILD=$(printf '%s\n' "${VERSIONS_TO_BUILD[@]}" | jq -Rcs .)" >> "$GITHUB_OUTPUT"
+          echo "VERSIONS_TO_DELETE=$(printf '%s\n' "${VERSIONS_TO_DELETE[@]}" | jq -Rcs .)" >> "$GITHUB_OUTPUT"
 
   build-and-push-ghcr:
     name: Build & Push to GHCR
@@ -236,45 +246,93 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Remove Outdated GHCR Tags
-        if: needs.pre-build.outputs.tags_to_delete != '[]'
+      - name: Remove Deprecated Images From GHCR
+        id: remove-deprecated-ghcr
+        if: ${{ needs.pre-build.outputs.versions_to_delete != '[]' }}
+        env:
+          VERSIONS_TO_DELETE: ${{ needs.pre-build.outputs.versions_to_delete }}
+          GHCR_API_PREFIX: ${{ needs.pre-build.outputs.ghcr_api_prefix }}
         run: |
           set -euo pipefail
-          
-          echo "Removing outdated tags from GHCR..."
-          for tag in $(echo "$TAGS_TO_DELETE" | jq -r '.[]'); do
-            echo "Deleting tag: $tag"
-            response=$(curl -X DELETE \
-              -H "Authorization: Bearer $GH_TOKEN" \
-              -H "Accept: application/vnd.github+json" \
-              -w "%{http_code}" \
-              "${{ needs.pre-build.outputs.ghcr_url_base }}/packages/container/${{ github.event.repository.name }}/versions/$tag")
-            
-            if [[ "$response" =~ ^2[0-9][0-9]$ ]]; then
-              echo "Successfully deleted tag: $tag"
-            else
-              echo "Failed to delete tag: $tag (HTTP $response)"
-              exit 1
+
+          echo "Removing deprecated images from GHCR..."
+          latest_deleted=false
+          versions=$(gh api --paginate "/$GHCR_API_PREFIX/packages/container/${{ github.event.repository.name }}/versions?per_page=100")
+
+          for tag in $(echo "$VERSIONS_TO_DELETE" | jq -re '.[]'); do
+            # Find the version ID for this tag
+            version_id=$(echo "$versions" | jq -re --arg tag "$tag" '.[] | select(.metadata.container.tags[]? == $tag) | .id' | head -n1)
+            if [[ -z "$version_id" ]]; then
+              echo "Could not find version ID for tag: $tag"
+              continue
             fi
+            # Check if this version contains 'latest' tag
+            tags=$(echo "$versions" | jq -re --arg id "$version_id" '.[] | select(.id == ($id|tonumber)) | .metadata.container.tags[]?')
+            if echo "$tags" | grep -wq "latest"; then
+              latest_deleted=true
+              echo "The 'latest' tag will be deleted with version ID: $version_id"
+            fi
+            echo "Deleting version ID: $version_id (tags: $tags)..."
+            gh api --method DELETE "/$GHCR_API_PREFIX/packages/container/${{ github.event.repository.name }}/versions/$version_id"
           done
-          echo "Tag cleanup completed on GHCR"
+          echo "Cleanup completed"
+
+          echo "LATEST_DELETED=$latest_deleted" >> "$GITHUB_OUTPUT"
 
       - name: Build and Push GHCR Images
         env:
-          upstream_license: ${{ needs.pre-build.outputs.upstream_license }}
+          UPSTREAM_LICENSE: ${{ needs.pre-build.outputs.upstream_license }}
+          TAGS_TO_BUILD: ${{ needs.pre-build.outputs.versions_to_build }}
+          GHCR_API_PREFIX: ${{ needs.pre-build.outputs.ghcr_api_prefix }}
         run: |
           set -euo pipefail
-          
+
           if [[ "$TAGS_TO_BUILD" == "[]" ]]; then
-            echo "No tags to build"
+            echo "No new tags to build"
+            if [[ "${{ steps.remove-deprecated-ghcr.outputs.LATEST_DELETED }}" == "true" ]]; then
+              echo "Latest tag was deleted. Calculating new latest tag and re-tagging..."
+              versions=$(gh api --paginate "/$GHCR_API_PREFIX/packages/container/${{ github.event.repository.name }}/versions?per_page=100")
+              new_latest_tag=$(echo "$versions" | jq -re '.[].metadata.container.tags[]?' | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)
+              if [[ -n "$new_latest_tag" ]]; then
+                echo "Pulling $new_latest_tag before deletion..."
+                docker pull "ghcr.io/${{ github.actor }}/${{ github.event.repository.name }}:$new_latest_tag"
+                docker tag "ghcr.io/${{ github.actor }}/${{ github.event.repository.name }}:$new_latest_tag" "ghcr.io/${{ github.actor }}/${{ github.event.repository.name }}:latest"
+                docker push "ghcr.io/${{ github.actor }}/${{ github.event.repository.name }}:latest"
+                echo "Re-tagged $new_latest_tag as latest."
+              else
+                echo "Latest tag is intact, no re-tagging needed"
+              fi
+            fi
             exit 0
           fi
 
+          get_semver_tags() {
+            local tag="$1"
+            local prefix=""
+            if [[ "$tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              prefix="v"
+              major="${BASH_REMATCH[1]}"
+              minor="${BASH_REMATCH[2]}"
+              echo "${prefix}${major}"
+              echo "${prefix}${major}.${minor}"
+            elif [[ "$tag" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              major="${BASH_REMATCH[1]}"
+              minor="${BASH_REMATCH[2]}"
+              echo "${major}"
+              echo "${major}.${minor}"
+            fi
+          }
+
+          latest_tag=$(echo "$TAGS_TO_BUILD" | jq -re '.[]' | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)
+          echo "Latest tag applied to $latest_tag"
+
           current_commit=$(git rev-parse HEAD)
-          for platform in $(echo "$BUILDX_PLATFORMS" | jq -r '.[]'); do
-            for tag in $(echo "$TAGS_TO_BUILD" | jq -r '.[]'); do
+          readarray -t platforms < <(echo "$BUILDX_PLATFORMS" | jq -r '.[]')
+          readarray -t tags < <(echo "$TAGS_TO_BUILD" | jq -r '.[]')
+
+          for platform in "${platforms[@]}"; do
+            for tag in $(echo "${tags[@]}" | jq -re '.[]'); do
               echo "Building for platform: $platform, tag: $tag"
-              echo "Checking out tag: $tag"
               if ! git checkout "$tag"; then
                 echo "[ERROR] Failed to checkout tag: $tag"
                 git checkout "$current_commit"
@@ -286,8 +344,8 @@ jobs:
                 git checkout "$current_commit"
                 exit 1
               fi
-  
-              build_args=(
+
+              basic_args=(
                 --platform "$platform"
                 --tag "ghcr.io/${{ github.actor }}/${{ github.event.repository.name }}:$tag"
                 
@@ -317,32 +375,60 @@ jobs:
               )
 
               # Add license label if available
-              if [[ -n "$upstream_license" ]]; then
-                build_args+=(--label "org.opencontainers.image.licenses=$upstream_license")
+              if [[ -n "$UPSTREAM_LICENSE" ]]; then
+                basic_args+=(--label "org.opencontainers.image.licenses=$UPSTREAM_LICENSE")
               fi
+
+              # Add latest tag if applicable
+              if [[ "$tag" == "$latest_tag" ]]; then
+                basic_args+=(--tag "ghcr.io/${{ github.actor }}/${{ github.event.repository.name }}:latest")
+              fi
+
+              # Add major/minor semver tags
+              extra_tags=()
+              while read -r extra; do
+                [[ -n "$extra" && "$extra" != "$tag" ]] && extra_tags+=("$extra")
+              done < <(get_semver_tags "$tag")
+              for extra in "${extra_tags[@]}"; do
+                basic_args+=(--tag "ghcr.io/${{ github.actor }}/${{ github.event.repository.name }}:$extra")
+              done
 
               # Execute build
               echo "Building image for platform: $platform, tag: $tag"
-              if ! docker buildx build "${build_args[@]}" .; then
+              if ! docker buildx build "${basic_args[@]}" .; then
                 echo "[ERROR] Failed to build/push for platform: $platform, tag: $tag"
                 git checkout "$current_commit"
                 exit 1
               fi
-              
-              echo "[SUCCESS] Built and pushed for platform: $platform, tag: $tag"             
+
+              echo "[SUCCESS] Built and pushed for platform: $platform, tag: $tag"
               git checkout "$current_commit"
             done
           done
 
+          # Set GHCR repository description if it doesn't exist
           if [[ "${{ needs.pre-build.outputs.ghcr_repo_exists }}" == "false" ]]; then
             echo "Setting GHCR repository description..."
-            curl -X PATCH \
+            gh api \
+              --method PATCH \
               -H "Accept: application/vnd.github+json" \
-              -H "Authorization: Bearer $GH_TOKEN" \
               -H "X-GitHub-Api-Version: 2022-11-28" \
-              -d "{\"description\":\"Docker image built from ${{ github.server_url }}/${{ github.repository }}\",\"repository_url\":\"${{ github.server_url }}/${{ github.repository }}\"}" \
-              "${{ needs.pre-build.outputs.ghcr_url_base }}/packages/container/${{ github.event.repository.name }}"
+              "$GHCR_API_PREFIX/packages/container/${{ github.event.repository.name }}" \
+              -f description="Docker image built from ${{ github.server_url }}/${{ github.repository }}" \
+              -f repository_url="${{ github.server_url }}/${{ github.repository }}"
             echo "GHCR repository description updated"
+
+            # Set GHCR repo public
+            package_id=$(gh api "$GHCR_API_PREFIX/packages/container/${{ github.event.repository.name }}" --jq '.id')
+            if [[ -n "$package_id" ]]; then
+              gh api graphql -f query='
+                mutation($input: ChangePackageVisibilityInput!) {
+                  changePackageVisibility(input: $input) {
+                    package { id visibility }
+                  }
+                }' -f input='{"packageId":"'"$package_id"'","visibility":"PUBLIC"}'
+              echo "GHCR repository set to public"
+            fi
           fi
 
   build-and-push-dockerhub:
@@ -373,46 +459,151 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_PAT }}
 
-      - name: Remove Outdated Docker Hub Tags
-        if: needs.pre-build.outputs.tags_to_delete != '[]'
+      - name: Remove Deprecated Images From Docker Hub
+        if: ${{ needs.pre-build.outputs.versions_to_delete != '[]' }}
+        env:
+          VERSIONS_TO_DELETE: ${{ needs.pre-build.outputs.versions_to_delete }}
         run: |
           set -euo pipefail
-          
-          echo "Removing outdated tags from Docker Hub..."
-          for tag in $(echo "$TAGS_TO_DELETE" | jq -r '.[]'); do
-            echo "Deleting tag: $tag"
-            response=$(curl -X DELETE \
-              -u "${{ secrets.DOCKERHUB_USERNAME }}:${{ secrets.DOCKERHUB_PAT }}" \
-              -w "%{http_code}" \
-              "https://hub.docker.com/v2/repositories/${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}/tags/$tag/")
-            
-            if [[ "$response" =~ ^2[0-9][0-9]$ ]]; then
-              echo "Successfully deleted tag: $tag"
-            else
-              echo "Failed to delete tag: $tag (HTTP $response)"
-              exit 1
-            fi
+
+          echo "Removing deprecated images from Docker Hub..."
+          latest_deleted=false
+
+          # Build tag-to-digest and digest-to-tags maps
+          declare -A tag_to_digest
+          declare -A digest_to_tags
+          next_url="https://hub.docker.com/v2/repositories/${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}/tags?page_size=100"
+          while [[ -n "$next_url" ]]; do
+            dh_response=$(curl -sf "$next_url")
+            mapfile -t batch_tags < <(echo "$dh_response" | jq -re '.results[].name // empty')
+            mapfile -t batch_digests < <(echo "$dh_response" | jq -re '.results[].digest // empty')
+            for i in "${!batch_tags[@]}"; do
+              batch_tag="${batch_tags[$i]}"
+              batch_digest="${batch_digests[$i]}"
+              tag_to_digest["$batch_tag"]="$batch_digest"
+              if [[ -n "$batch_digest" ]]; then
+                digest_to_tags["$batch_digest"]+="$batch_tag "
+              fi
+            done
+            next_url=$(echo "$dh_response" | jq -r '.next // empty')
           done
-          echo "Tag cleanup completed on Docker Hub"
+
+          # Track which digests have been deleted to avoid duplicates
+          declare -A deleted_digests
+
+          for tag in $(echo "$VERSIONS_TO_DELETE" | jq -re '.[]'); do
+            digest="${tag_to_digest[$tag]}"
+            # Skip if already deleted
+            if [[ -z "$digest" || -n "${deleted_digests[$digest]:-}" ]]; then
+              continue
+            fi
+            tags="${digest_to_tags[$digest]}"
+            if echo "$tags" | grep -wq "latest"; then
+              latest_deleted=true
+              echo "The 'latest' tag will be deleted with digest: $digest"
+            fi
+            for t in $tags; do
+              echo "Deleting tag: $t (digest: $digest)..."
+              curl_opts=(-s -f -u "${{ secrets.DOCKERHUB_USERNAME }}:${{ secrets.DOCKERHUB_PAT }}" -o /dev/null -w "%{http_code}")
+              http_code=$(curl "${curl_opts[@]}" -X DELETE \
+                "https://hub.docker.com/v2/repositories/${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}/tags/$t/")
+              if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+                echo "Successfully deleted tag: $t"
+              else
+                echo "Failed to delete tag: $t (HTTP $http_code)"
+                exit 1
+              fi
+            done
+            deleted_digests["$digest"]=1
+          done
+          echo "Cleanup completed"
+
+          if [[ "$latest_deleted" == "true" ]]; then
+            echo "Re-tagging the new latest version as 'latest'..."
+            # Rebuild tag-to-digest and digest-to-tags maps after deletion
+            declare -A tag_to_digest_new
+            declare -A digest_to_tags_new
+            next_url="https://hub.docker.com/v2/repositories/${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}/tags?page_size=100"
+            while [[ -n "$next_url" ]]; do
+              dh_response=$(curl -sf "$next_url")
+              mapfile -t batch_tags < <(echo "$dh_response" | jq -re '.results[].name // empty')
+              mapfile -t batch_digests < <(echo "$dh_response" | jq -re '.results[].digest // empty')
+              for i in "${!batch_tags[@]}"; do
+                batch_tag="${batch_tags[$i]}"
+                batch_digest="${batch_digests[$i]}"
+                tag_to_digest_new["$batch_tag"]="$batch_digest"
+                if [[ -n "$batch_digest" ]]; then
+                  digest_to_tags_new["$batch_digest"]+="$batch_tag "
+                fi
+              done
+              next_url=$(echo "$dh_response" | jq -r '.next // empty')
+            done
+
+            # Find the new latest tag and its digest
+            all_tags=$(printf "%s\n" "${!tag_to_digest_new[@]}")
+            new_latest_tag=$(echo "$all_tags" | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)
+            if [[ -n "$new_latest_tag" ]]; then
+              new_latest_digest="${tag_to_digest_new[$new_latest_tag]}"
+              if [[ -n "$new_latest_digest" ]]; then
+                echo "Re-tagging $new_latest_tag (digest: $new_latest_digest) as 'latest'..."
+                response=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
+                  -u "${{ secrets.DOCKERHUB_USERNAME }}:${{ secrets.DOCKERHUB_PAT }}" \
+                  -H "Content-Type: application/json" \
+                  -d "{\"source_digest\": \"$new_latest_digest\"}" \
+                  "https://hub.docker.com/v2/repositories/${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}/tags/latest/")
+                if [[ "$response" =~ ^2[0-9][0-9]$ ]]; then
+                  echo "Successfully re-tagged $new_latest_tag (digest: $new_latest_digest) as 'latest'"
+                else
+                  echo "Failed to re-tag as 'latest' (HTTP $response)"
+                  exit 1
+                fi
+              else
+                echo "No suitable digest found to re-tag as 'latest'"
+              fi
+            else
+              echo "No suitable tag found to re-tag as 'latest'"
+            fi
+          fi
 
       - name: Build and Push Docker Hub Images
         env:
-          upstream_license: ${{ needs.pre-build.outputs.upstream_license }}
+          UPSTREAM_LICENSE: ${{ needs.pre-build.outputs.upstream_license }}
+          TAGS_TO_BUILD: ${{ needs.pre-build.outputs.tags_to_build }}
         run: |
           set -euo pipefail
-          
+
           if [[ "$TAGS_TO_BUILD" == "[]" ]]; then
             echo "No tags to build"
             exit 0
           fi
 
-          current_commit=$(git rev-parse HEAD)
-          for platform in $(echo "$BUILDX_PLATFORMS" | jq -r '.[]'); do
-            for tag in $(echo "$TAGS_TO_BUILD" | jq -r '.[]'); do
-              echo "Building for platform: $platform, tag: $tag"
+          get_semver_tags() {
+            local tag="$1"
+            local prefix=""
+            if [[ "$tag" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              prefix="v"
+              major="${BASH_REMATCH[1]}"
+              minor="${BASH_REMATCH[2]}"
+              echo "${prefix}${major}"
+              echo "${prefix}${major}.${minor}"
+            elif [[ "$tag" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              major="${BASH_REMATCH[1]}"
+              minor="${BASH_REMATCH[2]}"
+              echo "${major}"
+              echo "${major}.${minor}"
+            fi
+          }
 
-              # Checkout specific tag
-              echo "Checking out tag: $tag"
+          latest_tag=$(echo "$TAGS_TO_BUILD" | jq -re '.[]' | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)
+          echo "Latest tag applied to $latest_tag"
+
+          current_commit=$(git rev-parse HEAD)
+          readarray -t platforms < <(echo "$BUILDX_PLATFORMS" | jq -r '.[]')
+          readarray -t tags < <(echo "$TAGS_TO_BUILD" | jq -r '.[]')
+
+          for platform in "${platforms[@]}"; do
+            for tag in $(echo "${tags[@]}" | jq -re '.[]'); do
+              echo "Building for platform: $platform, tag: $tag"
               if ! git checkout "$tag"; then
                 echo "[ERROR] Failed to checkout tag: $tag"
                 git checkout "$current_commit"
@@ -426,7 +617,7 @@ jobs:
               fi
 
               # Prepare build arguments
-              build_args=(
+              basic_args=(
                 --platform "$platform"
                 --tag "${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:$tag"
                 
@@ -456,20 +647,36 @@ jobs:
               )
 
               # Add license label if available
-              if [[ -n "$upstream_license" ]]; then
-                build_args+=(--label "org.opencontainers.image.licenses=$upstream_license")
+              if [[ -n "$UPSTREAM_LICENSE" ]]; then
+                basic_args+=(--label "org.opencontainers.image.licenses=$UPSTREAM_LICENSE")
               fi
+
+              # Add latest tag if applicable
+              if [[ "$tag" == "$latest_tag" ]]; then
+                basic_args+=(--tag "${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:latest")
+              fi
+
+              # Add major/minor semver tags
+              extra_tags=()
+              while read -r extra; do
+                [[ -n "$extra" && "$extra" != "$tag" ]] && extra_tags+=("$extra")
+              done < <(get_semver_tags "$tag")
+              for extra in "${extra_tags[@]}"; do
+                basic_args+=(--tag "${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:$extra")
+              done
 
               # Execute build
               echo "Building image for platform: $platform, tag: $tag"
-              if ! docker buildx build "${build_args[@]}" .; then
+              if ! docker buildx build "${basic_args[@]}" .; then
                 echo "[ERROR] Failed to build/push for platform: $platform, tag: $tag"
                 exit 1
               fi
               echo "[SUCCESS] Built and pushed for platform: $platform, tag: $tag"
+              git checkout "$current_commit"
             done
           done
 
+          # Set Docker Hub repository description if it doesn't exist
           if [[ "${{ needs.pre-build.outputs.dh_repo_exists }}" == "false" ]]; then
             echo "Setting Docker Hub repository description..."
             curl -X PATCH \

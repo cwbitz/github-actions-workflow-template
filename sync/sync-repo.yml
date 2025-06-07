@@ -23,6 +23,7 @@ jobs:
       upstream_full_name: ${{ steps.collect-repo-metadata.outputs.UPSTREAM_FULL_NAME }}
       upstream_url: ${{ steps.collect-repo-metadata.outputs.UPSTREAM_URL }}
       upstream_default_branch: ${{ steps.collect-repo-metadata.outputs.UPSTREAM_DEFAULT_BRANCH }}
+      origin_url: ${{ steps.collect-repo-metadata.outputs.ORIGIN_URL }}
     steps:
       - name: Collect Upstream and Origin Repository Metadata
         id: collect-repo-metadata
@@ -58,16 +59,20 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
+          token: ${{ secrets.PAT_WORKFLOW_WRITE }}
           fetch-depth: 0
 
       - name: Configure Git and Upstream Remote
         env:
           UPSTREAM_URL: ${{ needs.collect-metadata.outputs.upstream_url }}
+          PAT: ${{ secrets.PAT_WORKFLOW_WRITE }}
         run: |
           set -euo pipefail
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote set-url origin "https://x-access-token:${PAT}@github.com/${{ github.repository }}.git"
 
           if ! git remote get-url upstream &> /dev/null; then
             git remote add upstream "$UPSTREAM_URL"
@@ -79,8 +84,6 @@ jobs:
         id: sync-branches-and-tags
         env:
           UPSTREAM_DEFAULT_BRANCH: ${{ needs.collect-metadata.outputs.upstream_default_branch }}
-          UPSTREAM_BRANCHES: ${{ needs.collect-metadata.outputs.upstream_branches }}
-          ORIGIN_BRANCHES: ${{ needs.collect-metadata.outputs.origin_branches }}
         run: |
           set -euo pipefail
 
@@ -88,8 +91,16 @@ jobs:
           git fetch origin --tags
 
           # Prune and Sync Branches
-          mapfile -t upstream_branches < <(git for-each-ref --format='%(refname:strip=3)' refs/remotes/upstream/)
-          mapfile -t origin_branches < <(git for-each-ref --format='%(refname:strip=3)' refs/remotes/origin/)
+          mapfile -t upstream_branches < <(git for-each-ref --format='%(refname:strip=3)' refs/remotes/upstream/ | grep -v '^HEAD$')
+          mapfile -t origin_branches < <(git for-each-ref --format='%(refname:strip=3)' refs/remotes/origin/ | grep -v '^HEAD$')
+
+          echo "Checking for metadata directory conflicts..."
+          for upstream_branch in "${upstream_branches[@]}"; do
+            if git show "upstream/$upstream_branch:$METADATA_DIR" &>/dev/null; then
+              echo "[CONFLICTS] Metadata directory $METADATA_DIR in origin conflicts with upstream"
+              exit 1
+            fi
+          done
 
           if [[ -s "$FORK_BRANCHES_FILE" ]]; then
             mapfile -t fork_branches < "$FORK_BRANCHES_FILE"
@@ -108,7 +119,7 @@ jobs:
 
           echo "Detecting upstream-deleted branches to prune..."
           for origin_branch in "${origin_branches[@]}"; do
-            if ! echo "$upstream_branches" | grep -Fxq "$origin_branch"; then
+            if ! printf '%s\n' "${upstream_branches[@]}" | grep -Fxq "$origin_branch"; then
               if is_fork_created_branch "$origin_branch"; then
                 echo "Skipping fork-created branch $origin_branch..."
               else
@@ -117,37 +128,40 @@ jobs:
               fi
             fi
           done
-
-          git sparse-checkout set --no-cone --stdin <<"EOF"
-          /*
-          !$WORKFLOW_DIR
-          !$METADATA_DIR
-          EOF
-
-          echo "Syncing branches from upstream..."
+          
+          echo "Checking for branch name conflicts..."
           conflicts=()
           for upstream_branch in "${upstream_branches[@]}"; do
             if is_fork_created_branch "$upstream_branch"; then
-              echo "Conflict detected: Branch '$upstream_branch' exists in both upstream and fork-created branches!"
               conflicts+=("$upstream_branch")
             fi
           done
 
           if [ ${#conflicts[@]} -gt 0 ]; then
-            echo "Sync halted due to branch name conflicts!"
-            echo "The following branches exist in both upstream and fork-created branches:"
+            echo "[CONFLICTS] The following branches in origin conflict with upstream:"
             printf '%s\n' "${conflicts[@]}"
-            echo "Please resolve these conflicts manually and update the fork-created-branches.txt file accordingly."
+            echo "Rename those branches and update fork-created-branches.txt accordingly"
             exit 1
           fi
 
+          # Preserve Metadata and Workflow Directories
+          FORK_HEAD=$(git rev-parse HEAD)
           for upstream_branch in "${upstream_branches[@]}"; do
-            echo "Syncing upstream branch: $upstream_branch..."
-            git checkout "$upstream_branch" || git checkout -b "$upstream_branch"
+            git switch "$upstream_branch" 2>/dev/null || git switch -c "$upstream_branch"
             git reset --hard "upstream/$upstream_branch"
-            git push --force origin "$upstream_branch"
+
+            if git cat-file -e "$FORK_HEAD:$METADATA_DIR" 2>/dev/null; then
+              git restore --source="$FORK_HEAD" --staged --worktree "$METADATA_DIR"
+            fi
+
+            if git cat-file -e "$FORK_HEAD:$WORKFLOW_DIR" 2>/dev/null; then
+              git restore --source="$FORK_HEAD" --staged --worktree "$WORKFLOW_DIR"
+            fi
+
+            git diff --quiet && git reset --hard || git commit --amend --no-edit
+            git push --force-with-lease origin "$upstream_branch"
           done
-          
+
           # Prune and Sync Tags
           mapfile -t upstream_tags < <(git tag -l --sort=creatordate)
           mapfile -t origin_tags < <(git tag -l --sort=creatordate)
