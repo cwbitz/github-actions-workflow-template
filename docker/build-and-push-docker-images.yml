@@ -46,7 +46,10 @@ jobs:
             docker buildx inspect \
             | grep "Platforms:" \
             | sed 's/Platforms: //g' \
-            | jq -R 'split(",") | map(ltrimstr(" ") | rtrimstr(" "))'
+            | tr ',' '\n' \
+            | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+            | jq -R . \
+            | jq -s .
           )
           
           if [[ "$platforms" == "[]" ]]; then
