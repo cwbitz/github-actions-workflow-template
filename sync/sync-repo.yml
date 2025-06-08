@@ -140,7 +140,7 @@ jobs:
           if [ ${#conflicts[@]} -gt 0 ]; then
             echo "[CONFLICTS] The following branches in origin conflict with upstream:"
             printf '%s\n' "${conflicts[@]}"
-            echo "Rename those branches and update fork-created-branches.txt accordingly"
+            echo "Rename conflicted branches and update fork-created-branches.txt accordingly"
             exit 1
           fi
 
@@ -163,12 +163,16 @@ jobs:
             
             git switch "$upstream_branch" 2>/dev/null || git switch -c "$upstream_branch"
             git reset --hard "upstream/$upstream_branch"
-            
+
+            if [ -d "$WORKFLOW_DIR" ]; then
+              rm -rf "$WORKFLOW_DIR"
+            fi
             if [ -d "$temp_dir/$WORKFLOW_DIR" ]; then
               echo "Restoring workflow files..."
               mkdir -p "$WORKFLOW_DIR"
               cp -r "$temp_dir/$WORKFLOW_DIR/." "$WORKFLOW_DIR/"
             fi
+
             if [ -d "$temp_dir/$METADATA_DIR" ]; then
               echo "Restoring metadata files..."
               mkdir -p "$METADATA_DIR"
