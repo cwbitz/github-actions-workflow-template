@@ -148,14 +148,12 @@ jobs:
           for upstream_branch in "${upstream_branches[@]}"; do
             echo "Processing branch: $upstream_branch..."
             temp_dir=$(mktemp -d)
-            
             if git rev-parse --quiet --verify HEAD:"$WORKFLOW_DIR"; then
               echo "Preserving workflow files..."
               git archive HEAD "$WORKFLOW_DIR" | tar xf - -C "$temp_dir"
             else
               echo "No workflow files to preserve"
             fi
-
             if git rev-parse --quiet --verify HEAD:"$METADATA_DIR"; then
               echo "Preserving metadata files..."
               git archive HEAD "$METADATA_DIR" | tar xf - -C "$temp_dir"
@@ -167,15 +165,27 @@ jobs:
             git reset --hard "upstream/$upstream_branch"
             
             if [ -d "$temp_dir/$WORKFLOW_DIR" ]; then
-              cp -r "$temp_dir/$WORKFLOW_DIR" ./
+              echo "Restoring workflow files..."
+              mkdir -p "$WORKFLOW_DIR"
+              cp -r "$temp_dir/$WORKFLOW_DIR/." "$WORKFLOW_DIR/"
             fi
             if [ -d "$temp_dir/$METADATA_DIR" ]; then
-              cp -r "$temp_dir/$METADATA_DIR" ./
+              echo "Restoring metadata files..."
+              mkdir -p "$METADATA_DIR"
+              cp -r "$temp_dir/$METADATA_DIR/." "$METADATA_DIR/"
             fi            
             rm -rf "$temp_dir"
 
-            git add "$WORKFLOW_DIR" "$METADATA_DIR"
-            git diff --quiet && git reset --hard || git commit --amend -m "Sync with upstream and preserve workflow files"
+            if [ -n "$(ls -A "$WORKFLOW_DIR" 2>/dev/null)" ]; then
+              git add "$WORKFLOW_DIR"
+            fi
+            if [ -n "$(ls -A "$METADATA_DIR" 2>/dev/null)" ]; then
+              git add "$METADATA_DIR"
+            fi
+
+            if ! git diff --cached --quiet; then
+              git commit --amend -m "Sync with upstream and preserve workflow/metadata files"
+            fi
             git push --force-with-lease origin "$upstream_branch"
             echo "Completed processing branch: $upstream_branch"
           done
