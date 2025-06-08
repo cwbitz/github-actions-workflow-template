@@ -13,6 +13,17 @@ on:
         type: string
         required: true
 
+env:
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  DH_OWNER: ${{ vars.DH_USERNAME }}
+  DH_PAT: ${{ secrets.DH_PAT }}
+  GH_OWNER: ${{ github.actor }}
+  GH_REPO_NAME: ${{ github.event.repository.name }}
+  GH_REPO_FULL: ${{ github.repository }}
+  GH_SERVER_URL: ${{ github.server_url }}
+  SBOM_FORMAT: spdx
+
+
 jobs:
   pre-build:
     name: Pre-Build Setup
@@ -61,52 +72,64 @@ jobs:
       - name: Collect Upstream Metadata
         id: collect-upstream-metadata
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          upstream_full_name: ${{ inputs.upstream_full_name }}
+          UPSTREAM_REPO_FULL: ${{ inputs.upstream_full_name }}
         run: |
           set -euo pipefail
 
-          # Extract upstream repository's license
-          license=$(
-            curl -sf -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$upstream_full_name/license" \
-            | jq -r '.license?.spdx_id // ""'
-          )
-
-          if [[ -n $license ]]; then
-            echo "Detected license: $license from the upstream repository $upstream_full_name"
+          # Fetching upstream's license information
+          echo "Fetching license information from $UPSTREAM_REPO_FULL..."
+          license=""
+          if response=$(curl -sfL -H "Authorization: Bearer $GH_TOKEN" "https://api.github.com/repos/$UPSTREAM_REPO_FUL/license"); then
+            license=$(echo "$response" | jq -r '.license?.spdx_id // ""')
+            if [[ -n $license ]]; then
+              echo "Detected license: $license from the upstream repository"
+            else
+              echo "No license detected from the upstream repository"
+            fi
           else
-            echo "License not detected from the upstream repository $upstream_full_name"
+            echo "Warning: Could not fetch license information"
           fi
-
           echo "UPSTREAM_LICENSE=$license" >> "$GITHUB_OUTPUT"
 
-          # Extract upstream repository's contributors
-          contributors=$(
-            curl -sf "https://api.github.com/repos/$upstream_full_name/contributors" \
-            | jq -re '[.[] | select(.type == "User") | .login] | join(",")'
-          )
-
-          echo "Upstream repository contributors: $contributors"
+          # Fetching upstream's contributor information
+          echo "Fetching contributor information from $UPSTREAM_REPO_FULL..."
+          contributors=""
+          if response=$(curl -sfL "https://api.github.com/repos/$UPSTREAM_REPO_FUL/contributors"); then
+            contributors=$(echo "$response" | jq -re '[.[] | select(.type == "User") | .login] | join(",")' || echo "")
+            if [[ -n $contributors ]]; then
+              echo "Upstream's contributors: $contributors"
+            else
+              echo "No contributors found"
+            fi
+          else
+            echo "Warning: Could not fetch contributor information"
+          fi
           echo "UPSTREAM_CONTRIBUTORS=$contributors" >> "$GITHUB_OUTPUT"
 
       - name: Check Registry Repository Existence
         id: check-registry
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
 
+          echo "Starting registry existence check..."
           case "${{ inputs.registry }}" in
           "ghcr")
-            ghcr_response=$(gh api "repos/${{ github.repository }}")
+            echo "Checking GHCR repository..."
+            echo "Fetching repository info for $GH_REPO_FULL..."
+            ghcr_response=$(gh api "repos/$GH_REPO_FULL")
+            echo "Repository info retrieved, parsing owner type..."
             ghcr_owner_type=$(echo "$ghcr_response" | jq -re '.owner.type' | tr '[:upper:]' '[:lower:]')
+            echo "Owner type: $ghcr_owner_type"
             ghcr_owner_login=$(echo "$ghcr_response" | jq -re '.owner.login')
+            echo "Owner login: $ghcr_owner_login"
 
             case "$ghcr_owner_type" in
               organization)
+                echo "Setting API prefix for organization..."
                 ghcr_api_prefix="/orgs/$ghcr_owner_login"
                 ;;
               user)
+                echo "Setting API prefix for user..."
                 ghcr_api_prefix="/users/$ghcr_owner_login"
                 ;;
               *)
@@ -115,11 +138,13 @@ jobs:
                 ;;
             esac
 
+            echo "Using GHCR API prefix: $ghcr_api_prefix"
             echo "GHCR_API_PREFIX=$ghcr_api_prefix" >> "$GITHUB_OUTPUT"
 
-            ghcr_repo_id=$(gh api -X GET "$ghcr_api_prefix/packages/container/${{ github.event.repository.name }}" --silent --jq '.id' || true)
+            echo "Checking if GHCR package exists..."
+            ghcr_repo_id=$(gh api -X GET "$ghcr_api_prefix/packages/container/$GH_REPO_NAME" --silent --jq '.id' || true)
             if [[ -n "$ghcr_repo_id" ]]; then
-              echo "GHCR repository exists"
+              echo "GHCR repository exists with ID: $ghcr_repo_id"
               echo "GHCR_REPO_EXISTS=true" >> "$GITHUB_OUTPUT"
             else
               echo "GHCR repository does not exist yet"
@@ -127,19 +152,25 @@ jobs:
             fi
             ;;
           "dockerhub")
+            echo "Checking Docker Hub repository..."
             repo_exists=false
-            next_url="https://hub.docker.com/v2/repositories/${{ secrets.DOCKERHUB_USERNAME }}/?page_size=100"
+            next_url="https://hub.docker.com/v2/repositories/$DH_OWNER/?page_size=100"
+            echo "Scanning Docker Hub repositories for $DH_OWNER..."
+            
             while [[ -n "$next_url" ]]; do
+              echo "Fetching from: $next_url"
               dh_response=$(curl -sf "$next_url")
-              if echo "$dh_response" | jq -e --arg repo "${{ github.event.repository.name }}" '.results[] | select(.name == $repo)' > /dev/null; then
+              if echo "$dh_response" | jq -e --arg repo "$GH_REPO_NAME" '.results[] | select(.name == $repo)' > /dev/null; then
                 repo_exists=true
+                echo "Found matching repository"
                 break
               fi
               next_url=$(echo "$dh_response" | jq -r '.next // empty')
+              [[ -n "$next_url" ]] && echo "Moving to next page..."
             done
 
             if [[ "$repo_exists" == "true" ]]; then
-              echo "Docker Hub repository exists"
+              echo "Docker Hub repository exists: $DH_OWNER/$GH_REPO_NAME"
               echo "DH_REPO_EXISTS=true" >> "$GITHUB_OUTPUT"
             else
               echo "Docker Hub repository does not exist yet"
@@ -147,15 +178,16 @@ jobs:
             fi
             ;;
           *)
-            echo "Error: Unsupported registry '${{ inputs.registry }}'"
+            echo "Error: Unsupported registry '${{ inputs.registry }}'" >&2
             exit 1
             ;;
           esac
+          
+          echo "Registry check completed successfully"
 
       - name: Analyze Registry Tags
         id: analyze-tags
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ORIGIN_TAGS: ${{ inputs.origin_tags }}
         run: |
           set -euo pipefail
@@ -169,7 +201,7 @@ jobs:
           case "${{ inputs.registry }}" in
             "ghcr")
               echo "Analyzing GHCR tags..."
-              versions=$(gh api --paginate "$GHCR_API_PREFIX/packages/container/${{ github.event.repository.name }}/versions?per_page=100")
+              versions=$(gh api --paginate "$GHCR_API_PREFIX/packages/container/$GH_REPO_NAME/versions?per_page=100")
               mapfile -t ghcr_tags < <(echo "$versions" | jq -re '.[] | .metadata.container.tags[]?' | grep -E '^(v)?[0-9]+\.[0-9]+\.[0-9]+$')
 
               for tag in "${origin_tags[@]}"; do
@@ -187,7 +219,7 @@ jobs:
             "dockerhub")
               echo "Analyzing Docker Hub tags..."
               dh_tags=()
-              next_url="https://hub.docker.com/v2/repositories/${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}/tags?page_size=100"
+              next_url="https://hub.docker.com/v2/repositories/$DH_OWNERz/$GH_REPO_NAME/tags?page_size=100"
               while [[ -n "$next_url" ]]; do
                 dh_response=$(curl -sf "$next_url")
                 mapfile -t batch_tags < <(echo "$dh_response" | jq -re '.results[].name // empty' | grep -E '^(v)?[0-9]+\.[0-9]+\.[0-9]+$')
@@ -225,11 +257,9 @@ jobs:
       packages: write
     runs-on: ubuntu-latest
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       BUILDX_PLATFORMS: ${{ needs.pre-build.outputs.buildx_platforms }}
       TAGS_TO_DELETE: ${{ needs.pre-build.outputs.tags_to_delete }}
       TAGS_TO_BUILD: ${{ needs.pre-build.outputs.tags_to_build }}
-      SBOM_FORMAT: spdx
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -258,7 +288,7 @@ jobs:
 
           echo "Removing deprecated images from GHCR..."
           latest_deleted=false
-          versions=$(gh api --paginate "/$GHCR_API_PREFIX/packages/container/${{ github.event.repository.name }}/versions?per_page=100")
+          versions=$(gh api --paginate "/$GHCR_API_PREFIX/packages/container/$GH_REPO_NAME/versions?per_page=100")
 
           for tag in $(echo "$VERSIONS_TO_DELETE" | jq -re '.[]'); do
             # Find the version ID for this tag
@@ -274,7 +304,7 @@ jobs:
               echo "The 'latest' tag will be deleted with version ID: $version_id"
             fi
             echo "Deleting version ID: $version_id (tags: $tags)..."
-            gh api --method DELETE "/$GHCR_API_PREFIX/packages/container/${{ github.event.repository.name }}/versions/$version_id"
+            gh api --method DELETE "/$GHCR_API_PREFIX/packages/container/$GH_REPO_NAME/versions/$version_id"
           done
           echo "Cleanup completed"
 
@@ -292,13 +322,13 @@ jobs:
             echo "No new tags to build"
             if [[ "${{ steps.remove-deprecated-ghcr.outputs.LATEST_DELETED }}" == "true" ]]; then
               echo "Latest tag was deleted. Calculating new latest tag and re-tagging..."
-              versions=$(gh api --paginate "/$GHCR_API_PREFIX/packages/container/${{ github.event.repository.name }}/versions?per_page=100")
+              versions=$(gh api --paginate "/$GHCR_API_PREFIX/packages/container/$GH_REPO_NAME/versions?per_page=100")
               new_latest_tag=$(echo "$versions" | jq -re '.[].metadata.container.tags[]?' | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)
               if [[ -n "$new_latest_tag" ]]; then
                 echo "Pulling $new_latest_tag before deletion..."
-                docker pull "ghcr.io/${{ github.actor }}/${{ github.event.repository.name }}:$new_latest_tag"
-                docker tag "ghcr.io/${{ github.actor }}/${{ github.event.repository.name }}:$new_latest_tag" "ghcr.io/${{ github.actor }}/${{ github.event.repository.name }}:latest"
-                docker push "ghcr.io/${{ github.actor }}/${{ github.event.repository.name }}:latest"
+                docker pull "ghcr.io/$GH_OWNER/$GH_REPO_NAME:$new_latest_tag"
+                docker tag "ghcr.io/$GH_OWNER/$GH_REPO_NAME:$new_latest_tag" "ghcr.io/$GH_OWNER/$GH_REPO_NAME:latest"
+                docker push "ghcr.io/$GH_OWNER/$GH_REPO_NAME:latest"
                 echo "Re-tagged $new_latest_tag as latest."
               else
                 echo "Latest tag is intact, no re-tagging needed"
@@ -348,25 +378,25 @@ jobs:
 
               basic_args=(
                 --platform "$platform"
-                --tag "ghcr.io/${{ github.actor }}/${{ github.event.repository.name }}:$tag"
+                --tag "ghcr.io/$GH_OWNER/$GH_REPO_NAME:$tag"
                 
                 # Cache configuration
-                --cache-from "type=registry,ref=ghcr.io/${{ github.actor }}/${{ github.event.repository.name }}:cache-${{ github.ref_name }}"
-                --cache-to "type=registry,ref=ghcr.io/${{ github.actor }}/${{ github.event.repository.name }}:cache-${{ github.ref_name }},mode=max"
+                --cache-from "type=registry,ref=ghcr.io/$GH_OWNER/$GH_REPO_NAME:cache-$tag"
+                --cache-to "type=registry,ref=ghcr.io/$GH_OWNER/$GH_REPO_NAME:cache-$tag,mode=max"
                 
                 # OCI labels
-                --label "org.opencontainers.image.title=${{ github.event.repository.name }}"
+                --label "org.opencontainers.image.title=$GH_REPO_NAME"
                 --label "org.opencontainers.image.version=$tag"
-                --label "org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}"
+                --label "org.opencontainers.image.created=$(git log -1 --format=%aI "$tag")"
                 --label "org.opencontainers.image.authors=${{ needs.pre-build.outputs.upstream_contributors }}"
-                --label "org.opencontainers.image.revision=${{ github.sha }}"
+                --label "org.opencontainers.image.revision=$(git rev-parse "$tag")"
                 --label "org.opencontainers.image.sbom.format=$SBOM_FORMAT"
                 
                 # OCI annotations
-                --annotation "org.opencontainers.image.description=Docker image built from ${{ github.server_url }}/${{ github.repository }}"
-                --annotation "org.opencontainers.image.documentation=${{ github.server_url }}/${{ github.repository }}/docs"
-                --annotation "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}"
-                --annotation "org.opencontainers.image.url=https://github.com/${{ github.actor }}/${{ github.event.repository.name }}/packages"
+                --annotation "org.opencontainers.image.description=Docker image built from $GH_SERVER_URL/$GH_REPO_FULL"
+                --annotation "org.opencontainers.image.documentation=$GH_SERVER_URL/$GH_REPO_FULL/docs"
+                --annotation "org.opencontainers.image.source=$GH_SERVER_URL/$GH_REPO_FULL"
+                --annotation "org.opencontainers.image.url=https://github.com/$GH_OWNER/$GH_REPO_NAME/packages"
                 
                 # Build configuration
                 --provenance=inline
@@ -382,7 +412,7 @@ jobs:
 
               # Add latest tag if applicable
               if [[ "$tag" == "$latest_tag" ]]; then
-                basic_args+=(--tag "ghcr.io/${{ github.actor }}/${{ github.event.repository.name }}:latest")
+                basic_args+=(--tag "ghcr.io/$GH_OWNER/$GH_REPO_NAME:latest")
               fi
 
               # Add major/minor semver tags
@@ -391,7 +421,7 @@ jobs:
                 [[ -n "$extra" && "$extra" != "$tag" ]] && extra_tags+=("$extra")
               done < <(get_semver_tags "$tag")
               for extra in "${extra_tags[@]}"; do
-                basic_args+=(--tag "ghcr.io/${{ github.actor }}/${{ github.event.repository.name }}:$extra")
+                basic_args+=(--tag "ghcr.io/$GH_OWNER/$GH_REPO_NAME:$extra")
               done
 
               # Execute build
@@ -414,13 +444,13 @@ jobs:
               --method PATCH \
               -H "Accept: application/vnd.github+json" \
               -H "X-GitHub-Api-Version: 2022-11-28" \
-              "$GHCR_API_PREFIX/packages/container/${{ github.event.repository.name }}" \
-              -f description="Docker image built from ${{ github.server_url }}/${{ github.repository }}" \
-              -f repository_url="${{ github.server_url }}/${{ github.repository }}"
+              "$GHCR_API_PREFIX/packages/container/$GH_REPO_NAME" \
+              -f description="Docker image built from $GH_SERVER_URL/$GH_REPO_FULL" \
+              -f repository_url="$GH_SERVER_URL/$GH_REPO_FULL"
             echo "GHCR repository description updated"
 
             # Set GHCR repo public
-            package_id=$(gh api "$GHCR_API_PREFIX/packages/container/${{ github.event.repository.name }}" --jq '.id')
+            package_id=$(gh api "$GHCR_API_PREFIX/packages/container/$GH_REPO_NAME" --jq '.id')
             if [[ -n "$package_id" ]]; then
               gh api graphql -f query='
                 mutation($input: ChangePackageVisibilityInput!) {
@@ -443,7 +473,6 @@ jobs:
       BUILDX_PLATFORMS: ${{ needs.pre-build.outputs.buildx_platforms }}
       TAGS_TO_DELETE: ${{ needs.pre-build.outputs.tags_to_delete }}
       TAGS_TO_BUILD: ${{ needs.pre-build.outputs.tags_to_build }}
-      SBOM_FORMAT: spdx
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -457,8 +486,8 @@ jobs:
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_PAT }}
+          username: ${{ vars.DH_USERNAME }}
+          password: ${{ secrets.DH_PAT }}
 
       - name: Remove Deprecated Images From Docker Hub
         if: ${{ needs.pre-build.outputs.versions_to_delete != '[]' }}
@@ -473,7 +502,7 @@ jobs:
           # Build tag-to-digest and digest-to-tags maps
           declare -A tag_to_digest
           declare -A digest_to_tags
-          next_url="https://hub.docker.com/v2/repositories/${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}/tags?page_size=100"
+          next_url="https://hub.docker.com/v2/repositories/$DH_OWNER/$GH_REPO_NAME/tags?page_size=100"
           while [[ -n "$next_url" ]]; do
             dh_response=$(curl -sf "$next_url")
             mapfile -t batch_tags < <(echo "$dh_response" | jq -re '.results[].name // empty')
@@ -505,9 +534,9 @@ jobs:
             fi
             for t in $tags; do
               echo "Deleting tag: $t (digest: $digest)..."
-              curl_opts=(-s -f -u "${{ secrets.DOCKERHUB_USERNAME }}:${{ secrets.DOCKERHUB_PAT }}" -o /dev/null -w "%{http_code}")
+              curl_opts=(-s -f -u "$DH_OWNER:$DH_PAT" -o /dev/null -w "%{http_code}")
               http_code=$(curl "${curl_opts[@]}" -X DELETE \
-                "https://hub.docker.com/v2/repositories/${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}/tags/$t/")
+                "https://hub.docker.com/v2/repositories/$DH_OWNER/$GH_REPO_NAME/tags/$t/")
               if [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
                 echo "Successfully deleted tag: $t"
               else
@@ -524,7 +553,7 @@ jobs:
             # Rebuild tag-to-digest and digest-to-tags maps after deletion
             declare -A tag_to_digest_new
             declare -A digest_to_tags_new
-            next_url="https://hub.docker.com/v2/repositories/${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}/tags?page_size=100"
+            next_url="https://hub.docker.com/v2/repositories/$DH_OWNER/$GH_REPO_NAME/tags?page_size=100"
             while [[ -n "$next_url" ]]; do
               dh_response=$(curl -sf "$next_url")
               mapfile -t batch_tags < <(echo "$dh_response" | jq -re '.results[].name // empty')
@@ -548,10 +577,10 @@ jobs:
               if [[ -n "$new_latest_digest" ]]; then
                 echo "Re-tagging $new_latest_tag (digest: $new_latest_digest) as 'latest'..."
                 response=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
-                  -u "${{ secrets.DOCKERHUB_USERNAME }}:${{ secrets.DOCKERHUB_PAT }}" \
+                  -u "$DH_OWNER:$DH_PAT"" \
                   -H "Content-Type: application/json" \
                   -d "{\"source_digest\": \"$new_latest_digest\"}" \
-                  "https://hub.docker.com/v2/repositories/${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}/tags/latest/")
+                  "https://hub.docker.com/v2/repositories/$DH_OWNER/$GH_REPO_NAME/tags/latest/")
                 if [[ "$response" =~ ^2[0-9][0-9]$ ]]; then
                   echo "Successfully re-tagged $new_latest_tag (digest: $new_latest_digest) as 'latest'"
                 else
@@ -620,25 +649,25 @@ jobs:
               # Prepare build arguments
               basic_args=(
                 --platform "$platform"
-                --tag "${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:$tag"
+                --tag "$DH_OWNER/$GH_REPO_NAME:$tag"
                 
                 # Cache configuration
-                --cache-from "type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:cache-${{ github.ref_name }}"
-                --cache-to "type=registry,ref=${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:cache-${{ github.ref_name }},mode=max"
+                --cache-from "type=registry,ref=$DH_OWNER/$GH_REPO_NAME:cache-$tag"
+                --cache-to "type=registry,ref=$DH_OWNER/$GH_REPO_NAME:cache-$tag,mode=max"
                 
                 # OCI labels
-                --label "org.opencontainers.image.title=${{ github.event.repository.name }}"
+                --label "org.opencontainers.image.title=$GH_REPO_NAME"
                 --label "org.opencontainers.image.version=$tag"
-                --label "org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}"
+                --label "org.opencontainers.image.created=$(git log -1 --format=%aI "$tag")"
                 --label "org.opencontainers.image.authors=${{ needs.pre-build.outputs.upstream_contributors }}"
-                --label "org.opencontainers.image.revision=${{ github.sha }}"
+                --label "org.opencontainers.image.revision=$(git rev-parse "$tag")"
                 --label "org.opencontainers.image.sbom.format=$SBOM_FORMAT"
                 
                 # OCI annotations
-                --annotation "org.opencontainers.image.description=Docker image built from ${{ github.server_url }}/${{ github.repository }}"
-                --annotation "org.opencontainers.image.documentation=${{ github.server_url }}/${{ github.repository }}/docs"
-                --annotation "org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}"
-                --annotation "org.opencontainers.image.url=https://hub.docker.com/r/${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}"
+                --annotation "org.opencontainers.image.description=Docker image built from $GH_SERVER_URL/$GH_REPO_FULL"
+                --annotation "org.opencontainers.image.documentation=$GH_SERVER_URL/$GH_REPO_FULL/docs"
+                --annotation "org.opencontainers.image.source=$GH_SERVER_URL/$GH_REPO_FULL"
+                --annotation "org.opencontainers.image.url=https://hub.docker.com/r/$DH_OWNER/$GH_REPO_NAME"
                 
                 # Build configuration
                 --provenance=inline
@@ -654,7 +683,7 @@ jobs:
 
               # Add latest tag if applicable
               if [[ "$tag" == "$latest_tag" ]]; then
-                basic_args+=(--tag "${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:latest")
+                basic_args+=(--tag "$DH_OWNER/$GH_REPO_NAME:latest")
               fi
 
               # Add major/minor semver tags
@@ -663,7 +692,7 @@ jobs:
                 [[ -n "$extra" && "$extra" != "$tag" ]] && extra_tags+=("$extra")
               done < <(get_semver_tags "$tag")
               for extra in "${extra_tags[@]}"; do
-                basic_args+=(--tag "${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}:$extra")
+                basic_args+=(--tag "$DH_OWNER/$GH_REPO_NAME:$extra")
               done
 
               # Execute build
@@ -682,8 +711,8 @@ jobs:
             echo "Setting Docker Hub repository description..."
             curl -X PATCH \
               -H "Content-Type: application/json" \
-              -u "${{ secrets.DOCKERHUB_USERNAME }}:${{ secrets.DOCKERHUB_PAT }}" \
-              -d "{\"description\":\"Docker image built from ${{ github.server_url }}/${{ github.repository }}\",\"full_description\":\"Built from ${{ github.server_url }}/${{ github.repository }}\"}" \
-              "https://hub.docker.com/v2/repositories/${{ secrets.DOCKERHUB_USERNAME }}/${{ github.event.repository.name }}/"
+              -u "$DH_OWNER:$DH_PAT"" \
+              -d "{\"description\":\"Docker image built from $GH_SERVER_URL/$GH_REPO_FULL\",\"full_description\":\"Built from $GH_SERVER_URL/$GH_REPO_FULL\"}" \
+              "https://hub.docker.com/v2/repositories/$DH_OWNER/$GH_REPO_NAME/"
             echo "Docker Hub repository description updated"
           fi
