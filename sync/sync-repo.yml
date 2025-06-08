@@ -145,19 +145,20 @@ jobs:
           fi
 
           # Preserve Metadata and Workflow Directories
-          FORK_HEAD=$(git rev-parse HEAD)
           for upstream_branch in "${upstream_branches[@]}"; do
             echo "Processing branch: $upstream_branch..."
             temp_dir=$(mktemp -d)
             
-            if git ls-tree -r HEAD --name-only | grep -q "^${WORKFLOW_DIR}"; then
-              git checkout-index -f --prefix="$temp_dir/" -- "$WORKFLOW_DIR"
+            if git rev-parse --quiet --verify HEAD:"$WORKFLOW_DIR"; then
+              echo "Preserving workflow files..."
+              git archive HEAD "$WORKFLOW_DIR" | tar xf - -C "$temp_dir"
             else
               echo "No workflow files to preserve"
             fi
 
-            if git ls-tree -r HEAD --name-only | grep -q "^${METADATA_DIR}"; then
-              git checkout-index -f --prefix="$temp_dir/" -- "$METADATA_DIR"
+            if git rev-parse --quiet --verify HEAD:"$METADATA_DIR"; then
+              echo "Preserving metadata files..."
+              git archive HEAD "$METADATA_DIR" | tar xf - -C "$temp_dir"
             else
               echo "No metadata files to preserve"
             fi
