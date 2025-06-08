@@ -147,19 +147,36 @@ jobs:
           # Preserve Metadata and Workflow Directories
           FORK_HEAD=$(git rev-parse HEAD)
           for upstream_branch in "${upstream_branches[@]}"; do
+            echo "Processing branch: $upstream_branch..."
+            temp_dir=$(mktemp -d)
+            
+            if git ls-tree -r HEAD --name-only | grep -q "^${WORKFLOW_DIR}"; then
+              git checkout-index -f --prefix="$temp_dir/" -- "$WORKFLOW_DIR"
+            else
+              echo "No workflow files to preserve"
+            fi
+
+            if git ls-tree -r HEAD --name-only | grep -q "^${METADATA_DIR}"; then
+              git checkout-index -f --prefix="$temp_dir/" -- "$METADATA_DIR"
+            else
+              echo "No metadata files to preserve"
+            fi
+            
             git switch "$upstream_branch" 2>/dev/null || git switch -c "$upstream_branch"
             git reset --hard "upstream/$upstream_branch"
-
-            if git cat-file -e "$FORK_HEAD:$METADATA_DIR" 2>/dev/null; then
-              git restore --source="$FORK_HEAD" --staged --worktree "$METADATA_DIR"
+            
+            if [ -d "$temp_dir/$WORKFLOW_DIR" ]; then
+              cp -r "$temp_dir/$WORKFLOW_DIR" ./
             fi
+            if [ -d "$temp_dir/$METADATA_DIR" ]; then
+              cp -r "$temp_dir/$METADATA_DIR" ./
+            fi            
+            rm -rf "$temp_dir"
 
-            if git cat-file -e "$FORK_HEAD:$WORKFLOW_DIR" 2>/dev/null; then
-              git restore --source="$FORK_HEAD" --staged --worktree "$WORKFLOW_DIR"
-            fi
-
-            git diff --quiet && git reset --hard || git commit --amend --no-edit
+            git add "$WORKFLOW_DIR" "$METADATA_DIR"
+            git diff --quiet && git reset --hard || git commit --amend -m "Sync with upstream and preserve workflow files"
             git push --force-with-lease origin "$upstream_branch"
+            echo "Completed processing branch: $upstream_branch"
           done
 
           # Prune and Sync Tags

@@ -42,22 +42,20 @@ jobs:
           set -euo pipefail
 
           echo "Detecting supported buildx platforms..."
-          platforms=$(
-            docker buildx inspect \
+          # Create JSON array with proper formatting
+          platforms=$(docker buildx inspect \
             | grep "Platforms:" \
             | sed 's/Platforms: //g' \
             | tr ',' '\n' \
             | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
-            | jq -R . \
-            | jq -s .
+            | jq -Rsc .
           )
-          
+
           if [[ "$platforms" == "[]" ]]; then
-            echo "No platforms detected."
+            echo "No supported buildx platforms detected"
             exit 1
           fi
 
-          echo "Detected supported buildx platforms: $platforms"
           echo "BUILDX_PLATFORMS=$platforms" >> "$GITHUB_OUTPUT"
 
       - name: Collect Upstream Metadata
@@ -330,8 +328,8 @@ jobs:
           echo "Latest tag applied to $latest_tag"
 
           current_commit=$(git rev-parse HEAD)
-          readarray -t platforms < <(echo "$BUILDX_PLATFORMS" | jq -r '.[]')
-          readarray -t tags < <(echo "$TAGS_TO_BUILD" | jq -r '.[]')
+          mapfile -t platforms < <(echo "$BUILDX_PLATFORMS" | jq -r '.[]')
+          mapfile -t tags < <(echo "$TAGS_TO_BUILD" | jq -r '.[]')
 
           for platform in "${platforms[@]}"; do
             for tag in $(echo "${tags[@]}" | jq -re '.[]'); do
@@ -601,8 +599,8 @@ jobs:
           echo "Latest tag applied to $latest_tag"
 
           current_commit=$(git rev-parse HEAD)
-          readarray -t platforms < <(echo "$BUILDX_PLATFORMS" | jq -r '.[]')
-          readarray -t tags < <(echo "$TAGS_TO_BUILD" | jq -r '.[]')
+          mapfile -t platforms < <(echo "$BUILDX_PLATFORMS" | jq -r '.[]')
+          mapfile -t tags < <(echo "$TAGS_TO_BUILD" | jq -r '.[]')
 
           for platform in "${platforms[@]}"; do
             for tag in $(echo "${tags[@]}" | jq -re '.[]'); do
