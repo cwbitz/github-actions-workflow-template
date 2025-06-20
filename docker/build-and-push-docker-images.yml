@@ -3,6 +3,9 @@ name: Build & Push Docker Images
 on:
   workflow_call:
     inputs:
+      upstream_full_name:
+        type: string
+        required: true
       origin_tags:
         type: string
         required: true
@@ -79,13 +82,13 @@ jobs:
           retry_count=0
           while true; do
             set +e
-            response=$(gh api "repos/$UPSTREAM_REPO_FULL/license" 2>err.log)
+            response=$(gh api "repos/$UPSTREAM_REPO_FULL" 2>err.log)
             gh_exit=$?
             set -e
             if [[ $gh_exit -eq 0 ]]; then
               if [[ ! -s err.log ]]; then
-                license=$(echo "$response" | jq -r '.spdx_id // ""')
-                if [[ -n "$license" ]]; then
+                license=$(echo "$response" | jq -r '.license.spdx_id // ""')
+                if [[ -n "$license" && "$license" != "NOASSERTION" ]]; then
                   echo "Detected license: $license from the upstream repository"
                   echo "UPSTREAM_LICENSE=$license" >> "$GITHUB_OUTPUT"
                 else
@@ -96,7 +99,7 @@ jobs:
               fi
               case "$(cat err.log)" in
                 *"HTTP 404"*)
-                  echo "[ERROR] Upstream repository $UPSTREAM_REPO_FULL does NOT exsit (HTTP 404)"
+                  echo "[ERROR] Upstream repository $UPSTREAM_REPO_FULL does NOT exist (HTTP 404)"
                   exit 1
                   ;;
                 *"HTTP 429"*)
@@ -110,7 +113,7 @@ jobs:
                   continue
                   ;;
                 *"HTTP 500"*|*"HTTP 502"*|*"HTTP 503"*)
-                  echo "[ERROR] GitHub server error (HTTP $http_code). Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                  echo "[ERROR] GitHub server error. Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
                   ((retry_count++))
                   if ((retry_count >= max_retries)); then
                     echo "[ERROR] Server error after $retry_count attempts."
@@ -148,7 +151,7 @@ jobs:
             set -e
             if [[ $gh_exit -eq 0 ]]; then
               if [[ ! -s err.log ]]; then
-                contributors=$(echo "$response" | jq -re '[.[] | select(.type == "User") | .login] | join(",") // ""')
+                contributors=$(echo "$response" | jq -r '[.[] | select(.type == "User") | .login] | join(",") // ""')
                 if [[ -n "$contributors" ]]; then
                   echo "Upstream's contributors: $contributors"
                   echo "UPSTREAM_CONTRIBUTORS=$contributors" >> "$GITHUB_OUTPUT"
@@ -338,7 +341,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          mapfile -t origin_tags < <(echo "$ORIGIN_TAGS" | jq -re '.[]')
+          mapfile -t origin_tags < <(echo "$ORIGIN_TAGS" | jq -r '.[]')
           tags_with_dockerfile=()
           original_state=$(git rev-parse --abbrev-ref HEAD)
           for tag in "${origin_tags[@]}"; do
@@ -370,7 +373,7 @@ jobs:
                 if [[ $gh_exit -eq 0 ]]; then
                   if [[ ! -s err.log ]]; then
                     echo "GHCR package exists. Parsing tags..."
-                    mapfile -t ghcr_tags < <(echo "$versions" | jq -re '.[] | .metadata.container.tags[]?' | grep -E '^(v)?[0-9]+\.[0-9]+\.[0-9]+$')
+                    mapfile -t ghcr_tags < <(echo "$versions" | jq -r '.[] | .metadata.container.tags[]?' | grep -E '^(v)?[0-9]+\.[0-9]+\.[0-9]+$')
                     echo "GHCR_VERSIONS_JSON=$(echo "$versions" | jq -sc .)" >> "$GITHUB_OUTPUT"
                     break
                   fi
@@ -449,7 +452,7 @@ jobs:
                     200)
                       echo "Repo exists, parsing tags..."
                       dh_versions+=$(echo "$dh_body" | jq -c '.results[]')$'\n'
-                      mapfile -t batch_tags < <(echo "$dh_body" | jq -re '.results[].name // empty' | grep -E '^(v)?[0-9]+\.[0-9]+\.[0-9]+$')
+                      mapfile -t batch_tags < <(echo "$dh_body" | jq -r '.results[].name // empty' | grep -E '^(v)?[0-9]+\.[0-9]+\.[0-9]+$')
                       dh_tags+=("${batch_tags[@]}")
                       next_url=$(echo "$dh_body" | jq -r '.next // empty')
                       retry_count=0
@@ -649,9 +652,9 @@ jobs:
           set -euo pipefail
 
           echo "Removing deprecated images from GHCR..."
-          for tag in $(echo "$VERSIONS_TO_DELETE" | jq -re '.[]'); do
+          for tag in $(echo "$VERSIONS_TO_DELETE" | jq -r '.[]'); do
             # Find the version ID for this tag
-            version_id=$(echo "$GHCR_VERSIONS_JSON" | jq -re --arg tag "$tag" '.[] | select(.metadata.container.tags[]? == $tag) | .id' | head -n1)
+            version_id=$(echo "$GHCR_VERSIONS_JSON" | jq -r --arg tag "$tag" '.[] | select(.metadata.container.tags[]? == $tag) | .id' | head -n1)
             if [[ -z "$version_id" ]]; then
               echo "Could not find version ID for tag: $tag"
               continue
@@ -968,7 +971,7 @@ jobs:
           done
 
           latest_deleted=false
-          for version in $(echo "$VERSIONS_TO_DELETE" | jq -re '.[]'); do
+          for version in $(echo "$VERSIONS_TO_DELETE" | jq -r '.[]'); do
             digest="${tag_to_digest[$version]}"
             tags="${digest_to_tags[$digest]}"
             if echo "$tags" | grep -wq "latest"; then

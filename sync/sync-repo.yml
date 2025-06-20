@@ -27,6 +27,7 @@ jobs:
       ORIGIN_REPO_FULL: ${{ github.repository }}
     outputs:
       origin_tags: ${{ steps.sync-branches-and-tags.outputs.ORIGIN_TAGS }}
+      upstream_full_name: ${{ steps.fetch-parent-metadata.outputs.UPSTREAM_FULL_NAME }}
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -46,6 +47,7 @@ jobs:
 
           if echo "$response" | jq -e '.fork == true'; then
             echo "This repository is a fork. Fetching parent metadata..."
+            echo "UPSTREAM_FULL_NAME=$(echo "$response" | jq -r '.parent.full_name')" >> "$GITHUB_OUTPUT"
             echo "UPSTREAM_URL=$(echo "$response" | jq -r '.parent.clone_url')" >> "$GITHUB_OUTPUT"
           else
             echo "This repository is not a fork!"
@@ -226,14 +228,15 @@ jobs:
           echo "ORIGIN_TAGS=$(git tag -l --sort=creatordate | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
         shell: bash
 
-  build-and-push-images:
-    name: Build & Push Images to Registries
+  test-build-push-images:
+    name: Test, Build & Push Images to Registries
     needs: [sync-fork]
     strategy:
       matrix:
         registry: [ghcr, dockerhub]
-    uses: ./.github/workflows/build-and-push-docker-images.yml
+    uses: ./.github/workflows/test-build-push-docker-images.yml
     with:
+      upstream_full_name: ${{ needs.sync-fork.outputs.upstream_full_name }}
       origin_tags: ${{ needs.sync-fork.outputs.origin_tags }}
       registry: ${{ matrix.registry }}
     secrets:
