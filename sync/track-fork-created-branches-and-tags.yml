@@ -18,7 +18,7 @@ jobs:
   track:
     runs-on: ubuntu-latest
     env:
-      FORK_BRANCHES_FILE: $METADATA_DIR/fork-created-branches.txt
+      FORK_BRANCHES_FILE: $METADATA_DIR/fork-created-branches.json
       FORK_TAGS_FILE: $METADATA_DIR/fork-created-tags.json
     if: github.actor == github.repository_owner
     steps:
@@ -40,17 +40,15 @@ jobs:
               echo "ref_name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
               ;;
           esac
+        shell: bash
 
       - name: Ensure Metadata Directory Exists
         run: |
           set -euo pipefail
-
           if [[ ! -d "$METADATA_DIR" ]]; then
-            echo "Metadata directory does not exist. Creating $METADATA_DIR..."
             mkdir -p "$METADATA_DIR"
-          else
-            echo "Metadata directory already exists: $METADATA_DIR."
           fi
+        shell: bash
 
       - name: Update Tracking Files
         id: update-tracking
@@ -60,64 +58,95 @@ jobs:
         run: |
           set -euo pipefail
 
-          case "$REF_TYPE" in
-            "branch")
-              touch "$FORK_BRANCHES_FILE"
-              if ! grep -Fxq "$REF_NAME" "$FORK_BRANCHES_FILE"; then
-                echo "$REF_NAME" >> "$FORK_BRANCHES_FILE"
-                echo "added=true" >> "$GITHUB_ENV"
-              else
-                echo "Ref name already recorded."
-                echo "added=false" >> "$GITHUB_ENV"
-              fi
-              ;;
-            "tag")
-              if [[ ! -s "$FORK_TAGS_FILE" ]]; then
-                echo '[]' > "$FORK_TAGS_FILE"
-              fi
+          if [[ "$REF_TYPE" == "branch" ]]; then
+            if [[ ! -s "$FORK_BRANCHES_FILE" ]]; then
+              echo '[]' > "$FORK_BRANCHES_FILE"
+            fi
 
-              TAG_COMMIT=$(git rev-list -n 1 "$REF_NAME")
-              SOURCE_BRANCH=$(git for-each-ref --points-at "$TAG_COMMIT" --format='%(refname:short)' refs/heads/ | head -n1)
-              
-              if [[ -n "$SOURCE_BRANCH" ]] && grep -Fxq "$SOURCE_BRANCH" "$FORK_BRANCHES_FILE"; then
-                TAG_DATE=$(git show -s --format=%ci "$TAG_COMMIT")
-                TAG_AUTHOR=$(git show -s --format='%an <%ae>' "$TAG_COMMIT")
-                NEW_ENTRY=$(jq -nc \
-                  --arg name "$REF_NAME" \
-                  --arg branch "$SOURCE_BRANCH" \
-                  --arg commit "$TAG_COMMIT" \
-                  --arg date "$TAG_DATE" \
-                  --arg author "$TAG_AUTHOR" \
-                  '{name: $name, branch: $branch, commit: $commit, date: $date, author: $author}')
+            BRANCH_NAME="$REF_NAME"
+            BRANCH_COMMIT=$(git rev-parse "$REF_NAME")
+            BRANCH_DATE=$(git show -s --format=%ci "$BRANCH_COMMIT")
+            BRANCH_AUTHOR=$(git show -s --format='%an <%ae>' "$BRANCH_COMMIT")
+            NEW_ENTRY=$(jq -nc \
+              --arg name "$BRANCH_NAME" \
+              --arg commit "$BRANCH_COMMIT" \
+              --arg date "$BRANCH_DATE" \
+              --arg author "$BRANCH_AUTHOR" \
+              '{name: $name, commit: $commit, date: $date, author: $author}')
 
-                if ! jq -e --arg name "$REF_NAME" '.[] | select(.name == $name)' "$FORK_TAGS_FILE" > /dev/null; then
-                  jq --argjson entry "$NEW_ENTRY" '. += [$entry]' "$FORK_TAGS_FILE" > "${FORK_TAGS_FILE}.tmp"
-                  mv "${FORK_TAGS_FILE}.tmp" "$FORK_TAGS_FILE"
-                  echo "added=true" >> "$GITHUB_ENV"
-                else
-                  echo "Tag entry already recorded."
-                  echo "added=false" >> "$GITHUB_OUTPUT"
-                fi
-              else
-                echo "Tag is not on a fork-created branch, skipping..."
-                echo "added=false" >> "$GITHUB_OUTPUT"
+            # Check for upstream branch collision
+            if [[ -n "${{ github.event.repository.parent.full_name }}" ]]; then
+              git remote add upstream "https://github.com/${{ github.event.repository.parent.full_name }}.git"
+              git fetch upstream
+              if git branch -r | grep -Fq "upstream/$BRANCH_NAME"; then
+                echo "Error: Branch '$BRANCH_NAME' already exists in upstream. Please use a unique branch name."
+                exit 1
               fi
-              ;;
-          esac
+            fi
 
-      - name: Commit and Push New Ref
+            if ! jq -e --arg name "$BRANCH_NAME" '.[] | select(.name == $name)' "$FORK_BRANCHES_FILE" > /dev/null; then
+              jq --argjson entry "$NEW_ENTRY" '. += [$entry]' "$FORK_BRANCHES_FILE" > "${FORK_BRANCHES_FILE}.tmp"
+              mv "${FORK_BRANCHES_FILE}.tmp" "$FORK_BRANCHES_FILE"
+              echo "added=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Branch entry already recorded."
+              echo "added=false" >> "$GITHUB_OUTPUT"
+            fi
+
+          elif [[ "$REF_TYPE" == "tag" ]]; then
+            if [[ ! -s "$FORK_TAGS_FILE" ]]; then
+              echo '[]' > "$FORK_TAGS_FILE"
+            fi
+
+            TAG_NAME="$REF_NAME"
+            TAG_COMMIT=$(git rev-list -n 1 "$TAG_NAME")
+            TAG_DATE=$(git show -s --format=%ci "$TAG_COMMIT")
+            TAG_AUTHOR=$(git show -s --format='%an <%ae>' "$TAG_COMMIT")
+            NEW_ENTRY=$(jq -nc \
+              --arg name "$TAG_NAME" \
+              --arg commit "$TAG_COMMIT" \
+              --arg date "$TAG_DATE" \
+              --arg author "$TAG_AUTHOR" \
+              '{name: $name, commit: $commit, date: $date, author: $author}')
+
+            # Check for upstream tag collision
+            if [[ -n "${{ github.event.repository.parent.full_name }}" ]]; then
+              git remote add upstream "https://github.com/${{ github.event.repository.parent.full_name }}.git"
+              git fetch upstream --tags
+              if git tag -l | grep -Fxq "$TAG_NAME"; then
+                echo "Error: Tag '$TAG_NAME' already exists in upstream. Please use a unique tag name."
+                exit 1
+              fi
+            fi
+
+            if ! jq -e --arg name "$TAG_NAME" '.[] | select(.name == $name)' "$FORK_TAGS_FILE" > /dev/null; then
+              jq --argjson entry "$NEW_ENTRY" '. += [$entry]' "$FORK_TAGS_FILE" > "${FORK_TAGS_FILE}.tmp"
+              mv "${FORK_TAGS_FILE}.tmp" "$FORK_TAGS_FILE"
+              echo "added=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "Tag entry already recorded."
+              echo "added=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "Unknown ref type: $REF_TYPE"
+            echo "added=false" >> "$GITHUB_OUTPUT"
+          fi
+        shell: bash
+
+      - name: Commit and Push Tracking Changes
         if: ${{ steps.update-tracking.outputs.added == 'true' }}
         run: |
           set -euo pipefail
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          
-          git add "$METADATA_DIR/fork-created-*.json"
+
+          find "$METADATA_DIR" -type f \( -name 'fork-created-*.json' \) -exec git add {} +
 
           if ! git diff --staged --quiet; then
-            git commit -m "chore: Track fork-created ${{ steps.detect-ref.outputs.ref_type }}: ${{ steps.detect-ref.outputs.ref_name }}"       
+            git commit -m "chore: Track fork-created ref: ${{ steps.detect-ref.outputs.ref_type }} ${{ steps.detect-ref.outputs.ref_name }}"
             git push origin HEAD:${{ steps.detect-ref.outputs.ref_name }}
           else
             echo "No changes to commit"
           fi
+        shell: bash

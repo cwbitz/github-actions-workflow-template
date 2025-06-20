@@ -8,7 +8,6 @@ on:
 env:
   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   GH_PAT: ${{ secrets.GH_PAT }}
-  GH_REPO_FULL: ${{ github.repository }}
   WORKFLOW_DIR: .github/workflows/
   METADATA_DIR: .github/sync-metadata/
 
@@ -17,43 +16,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  collect-metadata:
-    name: Collect Repository Metadata
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    outputs:
-      upstream_full_name: ${{ steps.collect-repo-metadata.outputs.UPSTREAM_FULL_NAME }}
-      upstream_url: ${{ steps.collect-repo-metadata.outputs.UPSTREAM_URL }}
-      upstream_default_branch: ${{ steps.collect-repo-metadata.outputs.UPSTREAM_DEFAULT_BRANCH }}
-      origin_url: ${{ steps.collect-repo-metadata.outputs.ORIGIN_URL }}
-    steps:
-      - name: Collect Upstream and Origin Repository Metadata
-        id: collect-repo-metadata
-        run: |
-          set -euo pipefail
-
-          echo "Fetching repository metadata via Github API..."
-          response=$(curl -sf -H "Authorization: token $GH_TOKEN" "https://api.github.com/repos/$GH_REPO_FULL")
-
-          if echo "$response" | jq -e '.fork == true'; then
-            echo "This repository is a fork. Fetching metadata..."
-            echo "UPSTREAM_FULL_NAME=$(echo "$response" | jq -re '.parent.full_name')" >> "$GITHUB_OUTPUT"
-            echo "UPSTREAM_URL=$(echo "$response" | jq -r '.parent.clone_url')" >> "$GITHUB_OUTPUT"
-            echo "UPSTREAM_DEFAULT_BRANCH=$(echo "$response" | jq -re '.parent.default_branch')" >> "$GITHUB_OUTPUT"
-          else
-            echo "This repository is not a fork."
-          fi
-
   sync-fork:
     name: Sync Forked Repository
     runs-on: ubuntu-latest
-    needs: [collect-metadata]
     permissions:
       contents: write
     env:
-      FORK_BRANCHES_FILE: $METADATA_DIR/fork-created-branches.txt
+      FORK_BRANCHES_FILE: $METADATA_DIR/fork-created-branches.json
       FORK_TAGS_FILE: $METADATA_DIR/fork-created-tags.json
+      ORIGIN_REPO_FULL: ${{ github.repository }}
     outputs:
       origin_tags: ${{ steps.sync-branches-and-tags.outputs.ORIGIN_TAGS }}
     steps:
@@ -63,28 +34,44 @@ jobs:
           token: ${{ secrets.GH_PAT }}
           fetch-depth: 0
 
-      - name: Configure Git and Upstream Remote
+      - name: Fetch Parent Repository Metadata
+        id: fetch-parent-metadata
         env:
-          UPSTREAM_URL: ${{ needs.collect-metadata.outputs.upstream_url }}
-          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_REPO_FULL: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          echo "Fetching parent repository metadata..."
+          response=$(gh api repos/$GH_REPO_FULL)
+
+          if echo "$response" | jq -e '.fork == true'; then
+            echo "This repository is a fork. Fetching parent metadata..."
+            echo "UPSTREAM_URL=$(echo "$response" | jq -r '.parent.clone_url')" >> "$GITHUB_OUTPUT"
+          else
+            echo "This repository is not a fork!"
+            exit 1
+          fi
+
+      - name: Configure Git and Origin/Upstream Remote
+        env:
+          UPSTREAM_URL: ${{ steps.fetch-parent-metadata.outputs.UPSTREAM_URL }}
         run: |
           set -euo pipefail
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git remote set-url origin "https://x-access-token:${GH_PAT}@github.com/$GH_REPO_FULL.git"
+          git remote set-url origin "https://x-access-token:${GH_PAT}@github.com/$ORIGIN_REPO_FULL.git"
 
           if ! git remote get-url upstream &> /dev/null; then
             git remote add upstream "$UPSTREAM_URL"
           else
             git remote set-url upstream "$UPSTREAM_URL"
           fi
+        shell: bash
 
       - name: Sync Branches and Tags
         id: sync-branches-and-tags
-        env:
-          UPSTREAM_DEFAULT_BRANCH: ${{ needs.collect-metadata.outputs.upstream_default_branch }}
         run: |
           set -euo pipefail
 
@@ -104,7 +91,7 @@ jobs:
           done
 
           if [[ -s "$FORK_BRANCHES_FILE" ]]; then
-            mapfile -t fork_branches < "$FORK_BRANCHES_FILE"
+            mapfile -t fork_branches < <(jq -r '.[].name' "$FORK_BRANCHES_FILE")
           else
             fork_branches=()
           fi
@@ -138,10 +125,10 @@ jobs:
             fi
           done
 
-          if [ ${#conflicts[@]} -gt 0 ]; then
+          if [[ ${#conflicts[@]} -gt 0 ]]; then
             echo "[CONFLICTS] The following branches in origin conflict with upstream:"
             printf '%s\n' "${conflicts[@]}"
-            echo "Rename conflicted branches and update fork-created-branches.txt accordingly"
+            echo "Rename conflicted branches and update fork-created-branches.json accordingly"
             exit 1
           fi
 
@@ -167,14 +154,14 @@ jobs:
             rm -rf "$WORKFLOW_DIR"
             
             # Restore our workflow files if any
-            if [ -d "$temp_dir/$WORKFLOW_DIR" ]; then
+            if [[ -d "$temp_dir/$WORKFLOW_DIR" ]]; then
               echo "Restoring our workflow files..."
               mkdir -p "$WORKFLOW_DIR"
               cp -r "$temp_dir/$WORKFLOW_DIR/." "$WORKFLOW_DIR/"
             fi
 
             # Restore our metadata files if any
-            if [ -d "$temp_dir/$METADATA_DIR" ]; then
+            if [[ -d "$temp_dir/$METADATA_DIR" ]]; then
               echo "Restoring our metadata files..."
               mkdir -p "$METADATA_DIR"
               cp -r "$temp_dir/$METADATA_DIR/." "$METADATA_DIR/"
@@ -182,10 +169,10 @@ jobs:
             rm -rf "$temp_dir"
 
             # Add changes if directories exist and have content
-            if [ -n "$(ls -A "$WORKFLOW_DIR" 2>/dev/null)" ]; then
+            if [[ -n "$(ls -A "$WORKFLOW_DIR" 2>/dev/null)" ]]; then
               git add "$WORKFLOW_DIR"
             fi
-            if [ -n "$(ls -A "$METADATA_DIR" 2>/dev/null)" ]; then
+            if [[ -n "$(ls -A "$METADATA_DIR" 2>/dev/null)" ]]; then
               git add "$METADATA_DIR"
             fi
 
@@ -236,11 +223,12 @@ jobs:
             fi
           done
           
-          echo "ORIGIN_TAGS=$(git tag -l --sort=creatordate | jq -Rcs .)" >> "$GITHUB_OUTPUT"
+          echo "ORIGIN_TAGS=$(git tag -l --sort=creatordate | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
+        shell: bash
 
   build-and-push-images:
     name: Build & Push Images to Registries
-    needs: [collect-metadata, sync-fork]
+    needs: [sync-fork]
     strategy:
       matrix:
         registry: [ghcr, dockerhub]
@@ -248,4 +236,5 @@ jobs:
     with:
       origin_tags: ${{ needs.sync-fork.outputs.origin_tags }}
       registry: ${{ matrix.registry }}
-      upstream_full_name: ${{ needs.collect-metadata.outputs.upstream_full_name }}
+    secrets:
+      DH_PAT: ${{ secrets.DH_PAT }}
