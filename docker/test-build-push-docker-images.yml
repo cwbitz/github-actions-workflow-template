@@ -24,7 +24,7 @@ env:
   ORIGIN_REPO_NAME: ${{ github.event.repository.name }}
   ORIGIN_REPO_FULL: ${{ github.repository }}
   ORIGIN_SERVER_URL: ${{ github.server_url }}
-  GHCR_API_PREFIX: ${{ github.event.repository.owner.type == 'Organization' && format('orgs/{0}', github.repository_owner) || format('users/{0}', github.repository_owner) }}"
+  GHCR_API_PREFIX: ${{ github.event.repository.owner.type == 'Organization' && format('orgs/{0}', github.repository_owner) || format('users/{0}', github.repository_owner) }}
 
 jobs:
   pre-build:
@@ -82,61 +82,53 @@ jobs:
           retry_count=0
           while true; do
             set +e
-            response=$(gh api "repos/$UPSTREAM_REPO_FULL" 2>err.log)
+            response=$(gh api "repos/$UPSTREAM_REPO_FULL")
             gh_exit=$?
             set -e
             if [[ $gh_exit -eq 0 ]]; then
-              if [[ ! -s err.log ]]; then
-                license=$(echo "$response" | jq -r '.license.spdx_id // ""')
-                if [[ -n "$license" && "$license" != "NOASSERTION" ]]; then
-                  echo "Detected license: $license from the upstream repository"
-                  echo "UPSTREAM_LICENSE=$license" >> "$GITHUB_OUTPUT"
-                else
-                  echo "No license detected from the upstream repository"
-                  echo "UPSTREAM_LICENSE=" >> "$GITHUB_OUTPUT"
-                fi
-                break
+              license=$(echo "$response" | jq -r '.license.spdx_id // ""')
+              if [[ -n "$license" && "$license" != "NOASSERTION" ]]; then
+                echo "Detected license: $license from the upstream repository"
+                echo "UPSTREAM_LICENSE=$license" >> "$GITHUB_OUTPUT"
+              else
+                echo "No license detected from the upstream repository"
+                echo "UPSTREAM_LICENSE=" >> "$GITHUB_OUTPUT"
               fi
-              case "$(cat err.log)" in
-                *"HTTP 404"*)
-                  echo "[ERROR] Upstream repository $UPSTREAM_REPO_FULL does NOT exist (HTTP 404)"
+              break
+            else
+              status=$(echo "$response" | jq -r '.status // ""')
+              message=$(echo "$response" | jq -r '.message // ""')
+              case "$status" in
+                404)
+                  echo "GHCR API endpoint not found (HTTP 404: Not Found)"
                   exit 1
                   ;;
-                *"HTTP 429"*)
-                  echo "[ERROR] Rate limit exceeded (HTTP 429). Retrying in 60 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                429)
+                  echo "Rate limit exceeded (HTTP 429). Retrying in 60 seconds... (attempt $((retry_count + 1))/$max_retries)"
                   ((retry_count++))
                   if ((retry_count >= max_retries)); then
-                    echo "[ERROR] Rate limit exceeded after $retry_count attempts."
+                    echo "Rate limit exceeded after $retry_count attempts"
                     exit 1
                   fi
                   sleep 60
                   continue
                   ;;
-                *"HTTP 500"*|*"HTTP 502"*|*"HTTP 503"*)
-                  echo "[ERROR] GitHub server error. Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                500|502|503)
+                  echo "GitHub server error (HTTP $status). Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
                   ((retry_count++))
                   if ((retry_count >= max_retries)); then
-                    echo "[ERROR] Server error after $retry_count attempts."
+                    echo "Server error after $retry_count attempts"
                     exit 1
                   fi
                   sleep 10
                   continue
                   ;;
                 *)
-                  echo "[ERROR] Unexpected error:"
-                  cat err.log
+                  echo "Unexpected error:"
+                  echo "$response"
                   exit 1
                   ;;
               esac
-            else
-              echo "[ERROR] Network or gh api failure. Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
-              ((retry_count++))
-              if ((retry_count >= max_retries)); then
-                echo "[ERROR] Network or gh api failure after $retry_count attempts."
-                exit 1
-              fi
-              echo "Retrying in 10 seconds..."
-              sleep 10
             fi
           done
 
@@ -146,61 +138,53 @@ jobs:
           retry_count=0
           while true; do
             set +e
-            response=$(gh api "repos/$UPSTREAM_REPO_FULL/contributors" 2>err.log)
+            response=$(gh api "repos/$UPSTREAM_REPO_FULL/contributors")
             gh_exit=$?
             set -e
             if [[ $gh_exit -eq 0 ]]; then
-              if [[ ! -s err.log ]]; then
-                contributors=$(echo "$response" | jq -r '[.[] | select(.type == "User") | .login] | join(",") // ""')
-                if [[ -n "$contributors" ]]; then
-                  echo "Upstream's contributors: $contributors"
-                  echo "UPSTREAM_CONTRIBUTORS=$contributors" >> "$GITHUB_OUTPUT"
-                else
-                  echo "No contributors detected from the upstream repository"
-                  echo "UPSTREAM_CONTRIBUTORS=" >> "$GITHUB_OUTPUT"
-                fi
-                break
+              contributors=$(echo "$response" | jq -r '[.[] | select(.type == "User") | .login] | join(",") // ""')
+              if [[ -n "$contributors" ]]; then
+                echo "Upstream's contributors: $contributors"
+                echo "UPSTREAM_CONTRIBUTORS=$contributors" >> "$GITHUB_OUTPUT"
+              else
+                echo "No contributors detected from the upstream repository"
+                echo "UPSTREAM_CONTRIBUTORS=" >> "$GITHUB_OUTPUT"
               fi
-              case "$(cat err.log)" in
-                *"HTTP 404"*)
-                  echo "[ERROR] Upstream repository $UPSTREAM_REPO_FULL does NOT exsit (HTTP 404)"
+              break
+            else
+              status=$(echo "$response" | jq -r '.status // ""')
+              message=$(echo "$response" | jq -r '.message // ""')
+              case "$status" in
+                404)
+                  echo "GHCR API endpoint not found (HTTP 404: Not Found)"
                   exit 1
                   ;;
-                *"HTTP 429"*)
-                  echo "[ERROR] Rate limit exceeded (HTTP 429). Retrying in 60 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                429)
+                  echo "Rate limit exceeded (HTTP 429). Retrying in 60 seconds... (attempt $((retry_count + 1))/$max_retries)"
                   ((retry_count++))
                   if ((retry_count >= max_retries)); then
-                    echo "[ERROR] Rate limit exceeded after $retry_count attempts."
+                    echo "Rate limit exceeded after $retry_count attempts"
                     exit 1
                   fi
                   sleep 60
                   continue
                   ;;
-                *"HTTP 500"*|*"HTTP 502"*|*"HTTP 503"*)
-                  echo "[ERROR] GitHub server error (HTTP $http_code). Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                500|502|503)
+                  echo "GitHub server error (HTTP $status). Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
                   ((retry_count++))
                   if ((retry_count >= max_retries)); then
-                    echo "[ERROR] Server error after $retry_count attempts."
+                    echo "Server error after $retry_count attempts"
                     exit 1
                   fi
                   sleep 10
                   continue
                   ;;
                 *)
-                  echo "[ERROR] Unexpected error:"
-                  cat err.log
+                  echo "Unexpected error:"
+                  echo "$response"
                   exit 1
                   ;;
               esac
-            else
-              echo "[ERROR] Network or gh api failure. Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
-              ((retry_count++))
-              if ((retry_count >= max_retries)); then
-                echo "[ERROR] Network or gh api failure after $retry_count attempts."
-                exit 1
-              fi
-              echo "Retrying in 10 seconds..."
-              sleep 10
             fi
           done
 
@@ -217,56 +201,53 @@ jobs:
               retry_count=0
               while true; do
                 set +e
-                response=$(gh api "$GHCR_API_PREFIX/packages/container/$ORIGIN_REPO_NAME" 2>err.log)
+                response=$(gh api "$GHCR_API_PREFIX/packages/container/$ORIGIN_REPO_NAME")
                 gh_exit=$?
                 set -e
                 if [[ $gh_exit -eq 0 ]]; then
-                  if [[ ! -s err.log ]]; then
-                    echo "GHCR repository exists: $ORIGIN_REPO_FULL"
-                    echo "GHCR_REPO_EXISTS=true" >> "$GITHUB_OUTPUT"
-                    break
-                  fi
-                  case "$(cat err.log)" in
-                    *"HTTP 404"*)
-                      echo "[ERROR] GHCR repository does NOT exist (HTTP 404)"
-                      echo "GHCR_REPO_EXISTS=false" >> "$GITHUB_OUTPUT"
-                      break
+                  echo "GHCR repository exists: $ORIGIN_REPO_FULL"
+                  echo "GHCR_REPO_EXISTS=true" >> "$GITHUB_OUTPUT"
+                  break
+                else
+                  status=$(echo "$response" | jq -r '.status // ""')
+                  message=$(echo "$response" | jq -r '.message // ""')
+                  case "$status" in
+                    404)
+                      if [[ "$message" == "Package not found." ]]; then
+                        echo "GHCR repository does NOT exist (HTTP 404: Package not found)"
+                        echo "GHCR_REPO_EXISTS=false" >> "$GITHUB_OUTPUT"
+                        break
+                      else
+                        echo "GHCR API endpoint not found (HTTP 404: Not Found)"
+                        exit 1
+                      fi
                       ;;
-                    *"HTTP 429"*)
-                      echo "[ERROR] Rate limit exceeded (HTTP 429). Retrying in 60 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                    429)
+                      echo "Rate limit exceeded (HTTP 429). Retrying in 60 seconds... (attempt $((retry_count + 1))/$max_retries)"
                       ((retry_count++))
                       if ((retry_count >= max_retries)); then
-                        echo "[ERROR] Rate limit exceeded after $retry_count attempts."
+                        echo "Rate limit exceeded after $retry_count attempts"
                         exit 1
                       fi
                       sleep 60
                       continue
                       ;;
-                    *"HTTP 500"*|*"HTTP 502"*|*"HTTP 503"*)
-                      echo "[ERROR] GHCR server error. Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                    500|502|503)
+                      echo "GHCR server error (HTTP $status). Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
                       ((retry_count++))
                       if ((retry_count >= max_retries)); then
-                        echo "[ERROR] Server error after $retry_count attempts."
+                        echo "Server error after $retry_count attempts"
                         exit 1
                       fi
                       sleep 10
                       continue
                       ;;
                     *)
-                      echo "[ERROR] Unexpected error:"
-                      cat err.log
+                      echo "Unexpected error:"
+                      echo "$response"
                       exit 1
                       ;;
                   esac
-                else
-                  echo "[ERROR] Network or gh api failure. Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
-                  ((retry_count++))
-                  if ((retry_count >= max_retries)); then
-                    echo "[ERROR] Network or gh api failure after $retry_count attempts."
-                    exit 1
-                  fi
-                  echo "Retrying in 10 seconds..."
-                  sleep 10
                 fi
               done
               ;;
@@ -289,38 +270,38 @@ jobs:
                       break
                       ;;
                     404)
-                      echo "[ERROR] Docker Hub repository does NOT exist (HTTP 404)"
+                      echo "Docker Hub repository does NOT exist (HTTP 404)"
                       echo "DH_REPO_EXISTS=false" >> "$GITHUB_OUTPUT"
                       break
                       ;;
                     429)
-                      echo "[ERROR] Rate limit exceeded (HTTP 429). Retrying in 60 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                      echo "Rate limit exceeded (HTTP 429). Retrying in 60 seconds... (attempt $((retry_count + 1))/$max_retries)"
                       ((retry_count++))
                       if ((retry_count >= max_retries)); then
-                        echo "[ERROR] Rate limit exceeded after $retry_count attempts."
+                        echo "Rate limit exceeded after $retry_count attempts"
                         exit 1
                       fi
                       sleep 60
                       ;;
                     500|502|503)
-                      echo "[ERROR] Docker Hub server error (HTTP $http_code). Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                      echo "Docker Hub server error (HTTP $http_code). Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
                       ((retry_count++))
                       if ((retry_count >= max_retries)); then
-                        echo "[ERROR] Server error after $retry_count attempts."
+                        echo "Server error after $retry_count attempts"
                         exit 1
                       fi
                       sleep 10
                       ;;
                     *)
-                      echo "[ERROR] Unexpected HTTP status (HTTP $http_code)"
+                      echo "Unexpected HTTP status (HTTP $http_code)"
                       exit 1
                       ;;
                   esac
                 else
-                  echo "[ERROR] Network or curl failure. Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                  echo "Network or curl failure. Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
                   ((retry_count++))
                   if ((retry_count >= max_retries)); then
-                    echo "[ERROR] Network or curl failure after $retry_count attempts."
+                    echo "Network or curl failure after $retry_count attempts"
                     exit 1
                   fi
                   sleep 10
@@ -356,172 +337,186 @@ jobs:
           done
           echo "Detected ${#tags_with_dockerfile[@]} tags containing Dockerfile in origin Github repository"
 
-          versions_to_delete=()
-          versions_to_test=()
+          delete_versions=()
+          test_versions=()
 
           case "${{ inputs.registry }}" in
             "ghcr")
               echo "Analyzing GHCR tags..."
-              max_retries=5
-              retry_count=0
-              versions=""
-              while true; do
-                set +e
-                versions=$(gh api --paginate "$GHCR_API_PREFIX/packages/container/$ORIGIN_REPO_NAME/versions?per_page=100" 2>err.log)
-                gh_exit=$?
-                set -e
-                if [[ $gh_exit -eq 0 ]]; then
-                  if [[ ! -s err.log ]]; then
-                    echo "GHCR package exists. Parsing tags..."
-                    mapfile -t ghcr_tags < <(echo "$versions" | jq -r '.[] | .metadata.container.tags[]?' | grep -E '^(v)?[0-9]+\.[0-9]+\.[0-9]+$')
-                    echo "GHCR_VERSIONS_JSON=$(echo "$versions" | jq -sc .)" >> "$GITHUB_OUTPUT"
-                    break
-                  fi
-                  case "$(cat err.log)" in
-                    *"HTTP 404"*)
-                      echo "[ERROR] GHCR repository does NOT exist (HTTP 404)"
-                      echo "GHCR_VERSIONS_JSON=[]" >> "$GITHUB_OUTPUT"
+              case "${{ steps.check-registry.outputs.GHCR_REPO_EXISTS }}" in
+                "false")
+                  echo "GHCR repository does NOT exist. Skipping tag analysis."
+                  echo "GHCR_VERSIONS_JSON=[]" >> "$GITHUB_OUTPUT"
+                  versions_to_delete=[]
+                  versions_to_test=$(printf '%s\n' "${tags_with_dockerfile[@]}" | jq -R . | jq -sc .)
+                  ;;
+                "true")
+                  max_retries=5
+                  retry_count=0
+                  while true; do
+                    set +e
+                    response=$(gh api --paginate "$GHCR_API_PREFIX/packages/container/$ORIGIN_REPO_NAME/versions?per_page=100")
+                    gh_exit=$?
+                    set -e
+                    if [[ $gh_exit -eq 0 ]]; then
+                      echo "GHCR repository exists. Parsing tags..."
+                      mapfile -t ghcr_tags < <(echo "$response" | jq -r '.[] | .metadata.container.tags[]' | grep -E '^(v)?[0-9]+\.[0-9]+\.[0-9]+$')
+                      echo "GHCR_VERSIONS_JSON=$(echo "$response" | jq -sc .)" >> "$GITHUB_OUTPUT"
                       break
-                      ;;
-                    *"HTTP 429"*)
-                      echo "[ERROR] Rate limit exceeded (HTTP 429). Retrying in 60 seconds... (attempt $((retry_count + 1))/$max_retries)"
-                      ((retry_count++))
-                      if ((retry_count >= max_retries)); then
-                        echo "[ERROR] Rate limit exceeded after $retry_count attempts."
-                        exit 1
-                      fi
-                      sleep 60
-                      continue
-                      ;;
-                    *"HTTP 500"*|*"HTTP 502"*|*"HTTP 503"*)
-                      echo "[ERROR] GHCR server error. Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
-                      ((retry_count++))
-                      if ((retry_count >= max_retries)); then
-                        echo "[ERROR] Server error after $retry_count attempts."
-                        exit 1
-                      fi
-                      sleep 10
-                      continue
-                      ;;
-                    *)
-                      echo "[ERROR] Unexpected error:"
-                      cat err.log
-                      exit 1
-                      ;;
-                  esac
-                else
-                  echo "[ERROR] Network or gh api failure. Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
-                  ((retry_count++))
-                  if ((retry_count >= max_retries)); then
-                    echo "[ERROR] Network or gh api failure after $retry_count attempts."
-                    exit 1
-                  fi
-                  sleep 10
-                fi
-              done
+                    else
+                      status=$(echo "$response" | jq -r '.status // ""')
+                      message=$(echo "$response" | jq -r '.message // ""')
+                      case "$status" in
+                        429)
+                          echo "Rate limit exceeded (HTTP 429). Retrying in 60 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                          ((retry_count++))
+                          if ((retry_count >= max_retries)); then
+                            echo "Rate limit exceeded after $retry_count attempts"
+                            exit 1
+                          fi
+                          sleep 60
+                          continue
+                          ;;
+                        500|502|503)
+                          echo "GHCR server error (HTTP $status). Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                          ((retry_count++))
+                          if ((retry_count >= max_retries)); then
+                            echo "Server error after $retry_count attempts"
+                            exit 1
+                          fi
+                          sleep 10
+                          continue
+                          ;;
+                        *)
+                          echo "Unexpected error:"
+                          echo "$response"
+                          exit 1
+                          ;;
+                      esac
+                    fi
+                  done
 
-              for tag in "${ghcr_tags[@]}"; do
-                if ! printf '%s\n' "${tags_with_dockerfile[@]}" | grep -Fxq "$tag"; then
-                  versions_to_delete+=("$tag")
-                fi
-              done
+                  for tag in "${ghcr_tags[@]}"; do
+                    if ! printf '%s\n' "${tags_with_dockerfile[@]}" | grep -Fxq "$tag"; then
+                      delete_versions+=("$tag")
+                    fi
+                  done
+                  versions_to_delete=$(printf '%s\n' "${delete_versions[@]}" | jq -R . | jq -sc .)
 
-              for tag in "${tags_with_dockerfile[@]}"; do
-                if ! printf '%s\n' "${ghcr_tags[@]}" | grep -Fxq "$tag"; then
-                  versions_to_test+=("$tag")
-                fi
-              done
+                  for tag in "${tags_with_dockerfile[@]}"; do
+                    if ! printf '%s\n' "${ghcr_tags[@]}" | grep -Fxq "$tag"; then
+                      test_versions+=("$tag")
+                    fi
+                  done
+                  versions_to_test=$(printf '%s\n' "${test_versions[@]}" | jq -R . | jq -sc .)
+                  ;;
+                *)
+                  echo "Unexpected value for GHCR_REPO_EXISTS: '${{ steps.check-registry.outputs.GHCR_REPO_EXISTS }}'"
+                  exit 1
+                  ;;
+                esac
               ;;
 
             "dockerhub")
               echo "Analyzing Docker Hub tags..."
-              next_url="https://hub.docker.com/v2/repositories/$DH_OWNER/$ORIGIN_REPO_NAME/tags?page_size=100"
-              dh_versions_json=""
-              dh_tags=()
-              max_retries=5
-              retry_count=0
-              while [[ -n "$next_url" ]]; do
-                set +e
-                response=$(curl -sL -w "%{http_code}" "$next_url")
-                curl_exit=$?
-                set -e
-                if [[ $curl_exit -eq 0 ]]; then
-                  http_code="${response: -3}"
-                  dh_body="${response::-3}"
-                  case "$http_code" in
-                    200)
-                      echo "Repo exists, parsing tags..."
-                      dh_versions+=$(echo "$dh_body" | jq -c '.results[]')$'\n'
-                      mapfile -t batch_tags < <(echo "$dh_body" | jq -r '.results[].name // empty' | grep -E '^(v)?[0-9]+\.[0-9]+\.[0-9]+$')
-                      dh_tags+=("${batch_tags[@]}")
-                      next_url=$(echo "$dh_body" | jq -r '.next // empty')
-                      retry_count=0
-                      ;;
-                    404)
-                      echo "[ERROR] Docker Hub repository does NOT exsit (HTTP 404)."
-                      exit 1
-                      ;;
-                    429)
-                      echo "[ERROR] Rate limit exceeded (HTTP 429). Retrying in 60 seconds..."
+              case "${{ steps.check-registry.outputs.DH_REPO_EXISTS }}" in
+                "false")
+                  echo "Docker Hub repository does NOT exist. Skipping tag analysis."
+                  echo "DH_VERSIONS_JSON=[]" >> "$GITHUB_OUTPUT"
+                  versions_to_delete=[]
+                  versions_to_test=$(printf '%s\n' "${tags_with_dockerfile[@]}" | jq -R . | jq -sc .)
+                  ;;
+                "true")
+                  next_url="https://hub.docker.com/v2/repositories/$DH_OWNER/$ORIGIN_REPO_NAME/tags?page_size=100"
+                  dh_versions=""
+                  dh_tags=()
+                  max_retries=5
+                  retry_count=0
+                  while [[ -n "$next_url" ]]; do
+                    set +e
+                    response=$(curl -sL -w "%{http_code}" "$next_url")
+                    curl_exit=$?
+                    set -e
+                    if [[ $curl_exit -eq 0 ]]; then
+                      http_code="${response: -3}"
+                      dh_body="${response::-3}"
+                      case "$http_code" in
+                        200)
+                          echo "Repo exists, parsing tags..."
+                          dh_versions+=$(echo "$dh_body" | jq -c '.results[]')$'\n'
+                          mapfile -t batch_tags < <(echo "$dh_body" | jq -r '.results[].name // ""' | grep -E '^(v)?[0-9]+\.[0-9]+\.[0-9]+$')
+                          dh_tags+=("${batch_tags[@]}")
+                          next_url=$(echo "$dh_body" | jq -r '.next // ""')
+                          retry_count=0
+                          ;;
+                        429)
+                          echo "Rate limit exceeded (HTTP 429). Retrying in 60 seconds..."
+                          ((retry_count++))
+                          if ((retry_count >= max_retries)); then
+                            echo "Rate limit exceeded after $retry_count attempts"
+                            exit 1
+                          fi
+                          sleep 60
+                          ;;
+                        500|502|503)
+                          echo "Docker Hub server error (HTTP $http_code). Retrying in 10 seconds..."
+                          ((retry_count++))
+                          if ((retry_count >= max_retries)); then
+                            echo "Server error after $retry_count attempts"
+                            exit 1
+                          fi
+                          sleep 10
+                          ;;
+                        *)
+                          echo "Unexpected HTTP status (HTTP $http_code)"
+                          exit 1
+                          ;;
+                      esac
+                    else
+                      echo "Network or curl failure. Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
                       ((retry_count++))
                       if ((retry_count >= max_retries)); then
-                        echo "[ERROR] Rate limit exceeded after $retry_count attempts."
-                        exit 1
-                      fi
-                      sleep 60
-                      ;;
-                    500|502|503)
-                      echo "[ERROR] Docker Hub server error (HTTP $http_code). Retrying in 10 seconds..."
-                      ((retry_count++))
-                      if ((retry_count >= max_retries)); then
-                        echo "[ERROR] Server error after $retry_count attempts."
+                        echo "Network or curl failure after $retry_count attempts"
                         exit 1
                       fi
                       sleep 10
-                      ;;
-                    *)
-                      echo "[ERROR] Unexpected HTTP status (HTTP $http_code)"
-                      exit 1
-                      ;;
-                  esac
-                else
-                  echo "[ERROR] Network or curl failure. Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
-                  ((retry_count++))
-                  if ((retry_count >= max_retries)); then
-                    echo "[ERROR] Network or curl failure after $retry_count attempts."
-                    exit 1
+                    fi
+                  done
+
+                  if [[ -n "$dh_versions" ]]; then
+                    echo "DH_VERSIONS_JSON=$(echo "$dh_versions" | jq -sc .)" >> "$GITHUB_OUTPUT"
+                  else
+                    echo "DH_VERSIONS_JSON=[]" >> "$GITHUB_OUTPUT"
                   fi
-                  sleep 10
-                fi
-              done
 
-              if [[ -n "$dh_versions" ]]; then
-                echo "DH_VERSIONS_JSON=$(echo "$dh_versions" | jq -sc .)" >> "$GITHUB_OUTPUT"
-              else
-                echo "DH_VERSIONS_JSON=[]" >> "$GITHUB_OUTPUT"
-              fi
+                  for tag in "${dh_tags[@]}"; do
+                    if ! printf '%s\n' "${tags_with_dockerfile[@]}" | grep -Fxq "$tag"; then
+                      delete_versions+=("$tag")
+                    fi
+                  done
+                  versions_to_delete=$(printf '%s\n' "${delete_versions[@]}" | jq -R . | jq -sc .)
 
-              for tag in "${dh_tags[@]}"; do
-                if ! printf '%s\n' "${tags_with_dockerfile[@]}" | grep -Fxq "$tag"; then
-                  versions_to_delete+=("$tag")
-                fi
-              done
-
-              for tag in "${tags_with_dockerfile[@]}"; do
-                if ! printf '%s\n' "${dh_tags[@]}" | grep -Fxq "$tag"; then
-                  versions_to_test+=("$tag")
-                fi
-              done
+                  for tag in "${tags_with_dockerfile[@]}"; do
+                    if ! printf '%s\n' "${dh_tags[@]}" | grep -Fxq "$tag"; then
+                      test_versions+=("$tag")
+                    fi
+                  done
+                  versions_to_test=$(printf '%s\n' "${test_versions[@]}" | jq -R . | jq -sc .)
+                  ;;
+                *)
+                  echo "Error: Unexpected value for DH_REPO_EXISTS: '${{ steps.check-registry.outputs.DH_REPO_EXISTS }}'"
+                  exit 1
+                  ;;
+              esac
               ;;
-            
             *)
               echo "Error: Unsupported registry '${{ inputs.registry }}'"
               exit 1
               ;;
           esac
 
-          echo "VERSIONS_TO_TEST=$(printf '%s\n' "${versions_to_test[@]}" | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
-          echo "VERSIONS_TO_DELETE=$(printf '%s\n' "${versions_to_delete[@]}" | jq -R . | jq -sc .)" >> "$GITHUB_OUTPUT"
+          echo "VERSIONS_TO_DELETE=$versions_to_delete" >> "$GITHUB_OUTPUT"
+          echo "VERSIONS_TO_TEST=$versions_to_test" >> "$GITHUB_OUTPUT"
         shell: bash
 
   test-images:
@@ -565,7 +560,7 @@ jobs:
           for tag in "${tags[@]}"; do
             echo "Testing multi-arch image for tag: $tag"
             if ! git switch --detach "$tag"; then
-              echo "[ERROR] Failed to switch to tag: $tag"
+              echo "Failed to switch to tag: $tag"
               git switch --detach "$original_state"
               continue
             fi
@@ -583,12 +578,12 @@ jobs:
                   passed_platforms+=("$platform")
                   test_passed=true
                 else
-                  echo "[ERROR] Smoke test failed for $platform, tag: $tag"
+                  echo "Smoke test failed for $platform, tag: $tag"
                 fi
               else
-                echo "[ERROR] Build failed for $platform, tag: $tag"
+                echo "Build failed for $platform, tag: $tag"
               fi
-              docker rmi "$test_tag"
+              docker rmi "$test_tag" 2>/dev/null || true
             done
 
             git switch --detach "$original_state"
@@ -653,65 +648,62 @@ jobs:
 
           echo "Removing deprecated images from GHCR..."
           for tag in $(echo "$VERSIONS_TO_DELETE" | jq -r '.[]'); do
-            # Find the version ID for this tag
-            version_id=$(echo "$GHCR_VERSIONS_JSON" | jq -r --arg tag "$tag" '.[] | select(.metadata.container.tags[]? == $tag) | .id' | head -n1)
-            if [[ -z "$version_id" ]]; then
+            # version_id may be a multi-line string if multiple versions share the same tag
+            mapfile -t version_ids < <(echo "$GHCR_VERSIONS_JSON" | jq -r --arg tag "$tag" '.[] | select(.metadata.container.tags[] == $tag) | .id')
+            if [[ ${#version_ids[@]} -eq 0 ]]; then
               echo "Could not find version ID for tag: $tag"
-              continue
+              exit 1
             fi
-
-            max_retries=5
-            retry_count=0
-            while true; do
-              set +e
-              gh api --method DELETE "$GHCR_API_PREFIX/packages/container/$ORIGIN_REPO_NAME/versions/$version_id" 2>err.log
-              gh_exit=$?
-              set -e
-              if [[ $gh_exit -eq 0 ]]; then
-                if [[ ! -s err.log ]]; then
+            for version_id in "${version_ids[@]}"; do
+              max_retries=5
+              retry_count=0
+              while true; do
+                set +e
+                response=$(gh api --method DELETE "$GHCR_API_PREFIX/packages/container/$ORIGIN_REPO_NAME/versions/$version_id")
+                gh_exit=$?
+                set -e
+                if [[ $gh_exit -eq 0 ]]; then
                   echo "Successfully deleted version ID: $version_id (tag: $tag)"
                   break
-                fi
-                case "$(cat err.log)" in
-                  *"HTTP 429"*)
-                    echo "[ERROR] Rate limit exceeded (HTTP 429). Retrying in 60 seconds... (attempt $((retry_count + 1))/$max_retries)"
-                    ((retry_count++))
-                    if ((retry_count >= max_retries)); then
-                      echo "[ERROR] Rate limit exceeded after $retry_count attempts."
+                else
+                  status=$(echo "$response" | jq -r '.status // ""')
+                  message=$(echo "$response" | jq -r '.message // ""')
+                  case "$status" in
+                    429)
+                      echo "Rate limit exceeded (HTTP 429). Retrying in 60 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                      ((retry_count++))
+                      if ((retry_count >= max_retries)); then
+                        echo "Rate limit exceeded after $retry_count attempts"
+                        exit 1
+                      fi
+                      sleep 60
+                      continue
+                      ;;
+                    500|502|503)
+                      echo "GHCR server error (HTTP $status). Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                      ((retry_count++))
+                      if ((retry_count >= max_retries)); then
+                        echo "Server error after $retry_count attempts"
+                        exit 1
+                      fi
+                      sleep 10
+                      continue
+                      ;;
+                    *)
+                      echo "Unexpected error:"
+                      echo "$response"
                       exit 1
-                    fi
-                    sleep 60
-                    ;;
-                  *"HTTP 500"*|*"HTTP 502"*|*"HTTP 503"*)
-                    echo "[ERROR] GHCR server error. Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
-                    ((retry_count++))
-                    if ((retry_count >= max_retries)); then
-                      echo "[ERROR] Server error after $retry_count attempts."
-                      exit 1
-                    fi
-                    sleep 10
-                    ;;
-                  *)
-                    echo "[ERROR] Unexpected error:"
-                    cat err.log
-                    exit 1
-                    ;;
-                esac
-              else
-                echo "[ERROR] Network or gh api failure. Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
-                ((retry_count++))
-                if ((retry_count >= max_retries)); then
-                  echo "[ERROR] Network or gh api failure after $retry_count attempts."
-                  exit 1
+                      ;;
+                  esac
                 fi
-                sleep 10
-              fi
+              done
             done
           done
           echo "Cleanup completed"
 
           new_ghcr_versions=$(jq --argjson del "$VERSIONS_TO_DELETE" '
             [ .[]
+              | select(type == "object")
               | .metadata.container.tags[]?
               | select(
                   (test("^v?[0-9]+\\.[0-9]+\\.[0-9]+$"))
@@ -770,7 +762,7 @@ jobs:
 
             echo "Building multi-arch image for tag: $tag"
             if ! git switch --detach "$tag"; then
-              echo "[ERROR] Failed to switch to tag: $tag"
+              echo "Failed to switch to tag: $tag"
               git switch --detach "$original_state"
               exit 1
             fi
@@ -823,97 +815,12 @@ jobs:
             # Execute build
             echo "[INFO] Building and pushing multi-arch image: Tag \"$tag\" | Platforms: [$platforms] → GHCR"
             if ! docker buildx build "${build_args[@]}" .; then
-              echo "[ERROR] Failed to build/push for tag: $tag"
+              echo "Failed to build/push for tag: $tag"
               git switch --detach "$original_state"
               exit 1
             fi
             echo "[SUCCESS] Built and pushed multi-arch image for tag: $tag"
             git switch --detach "$original_state"
-
-            # Initialize GHCR repository settings
-            if [[ "${{ needs.pre-build.outputs.ghcr_repo_exists }}" == "false" ]]; then
-              echo "Initializing GHCR repository settings..."
-              max_retries=5
-              retry_count=0
-              package_id=""
-              while true; do
-                set +e
-                package_id=$(gh api "$GHCR_API_PREFIX/packages/container/$ORIGIN_REPO_NAME" --jq '.id' 2>/dev/null || true)
-                gh_exit=$?
-                set -e
-                if [[ $gh_exit -eq 0 ]]; then
-                  if [[ ! -s err.log ]]; then
-                    echo "GHCR repository is active, package ID: $package_id"
-                    break
-                  fi
-                  case "$(cat err.log)" in
-                    *"HTTP 404"*)
-                      echo "[ERROR] GHCR package does NOT exsit yet (HTTP 404). Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
-                      ((retry_count++))
-                      if ((retry_count >= max_retries)); then
-                        echo "[ERROR] GHCR package does NOT exsit after $retry_count attempts (HTTP 404)."
-                        exit 1
-                      fi
-                      sleep 10
-                      continue
-                      ;;
-                    *"HTTP 429"*)
-                      echo "[ERROR] Rate limit exceeded (HTTP 429). Retrying in 60 seconds..."
-                      ((retry_count++))
-                      if ((retry_count >= max_retries)); then
-                        echo "[ERROR] Rate limit exceeded after $retry_count attempts."
-                        exit 1
-                      fi
-                      sleep 60
-                      continue
-                      ;;
-                    *"HTTP 500"*|*"HTTP 502"*|*"HTTP 503"*)
-                      echo "[ERROR] GHCR server error. Retrying in 10 seconds..."
-                      ((retry_count++))
-                      if ((retry_count >= max_retries)); then
-                        echo "[ERROR] Server error after $retry_count attempts."
-                        exit 1
-                      fi
-                      sleep 10
-                      continue
-                      ;;
-                    *)
-                      echo "[ERROR] Unexpected error:"
-                      cat err.log
-                      exit 1
-                      ;;
-                  esac
-                else
-                  echo "[ERROR] Network or gh api failure. Retrying in 10 seconds..."
-                  ((retry_count++))
-                  if ((retry_count >= max_retries)); then
-                    echo "[ERROR] Network or gh api failure after $retry_count attempts."
-                    exit 1
-                  fi
-                  sleep 10
-                fi
-              done
-
-              if [[ -n "$package_id" ]]; then
-                # Set package visibility to public
-                gh api graphql -f query='
-                  mutation($input: ChangePackageVisibilityInput!) {
-                    changePackageVisibility(input: $input) {
-                      package { id visibility }
-                    }
-                  }' -f input='{"packageId":"'"$package_id"'","visibility":"PUBLIC"}'
-                echo "GHCR repository set to public"
-
-                # Update repo description
-                gh api --method PATCH \
-                  -H "Accept: application/vnd.github+json" \
-                  -H "X-GitHub-Api-Version: 2022-11-28" \
-                  "$GHCR_API_PREFIX/packages/container/$ORIGIN_REPO_NAME" \
-                  -f description="Docker image built from $ORIGIN_SERVER_URL/$ORIGIN_REPO_FULL" \
-                  -f repository_url="$ORIGIN_SERVER_URL/$ORIGIN_REPO_FULL"
-                echo "[SUCCESS] GHCR repository description updated"
-              fi
-            fi
           done
         shell: bash
 
@@ -996,50 +903,46 @@ jobs:
                       break
                       ;;
                     401|403)
-                      echo "[ERROR] Unauthorized or forbidden (HTTP $http_code). Check your Docker Hub credentials and permissions."
+                      echo "Unauthorized or forbidden (HTTP $http_code). Check your Docker Hub credentials and permissions."
                       exit 1
                       ;;
-                    404)
-                      echo "[ERROR] Tag $tag does NOT exist (HTTP 404). Skipping."
-                      break
-                      ;;
                     409)
-                      echo "[ERROR] Conflict (HTTP 409). The resource may be in use or locked. Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                      echo "Conflict (HTTP 409). The resource may be in use or locked. Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
                       ((retry_count++))
                       if ((retry_count >= max_retries)); then
-                        echo "[ERROR] Conflict (HTTP 409) after $retry_count attempts. Giving up."
+                        echo "Conflict (HTTP 409) after $retry_count attempts Giving up."
                         exit 1
                       fi
                       sleep 10
                       ;;
                     429)
-                      echo "[ERROR] Rate limit exceeded (HTTP 429). Retrying in 60 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                      echo "Rate limit exceeded (HTTP 429). Retrying in 60 seconds... (attempt $((retry_count + 1))/$max_retries)"
                       ((retry_count++))
                       if ((retry_count >= max_retries)); then
-                        echo "[ERROR] Rate limit exceeded after $retry_count attempts."
+                        echo "Rate limit exceeded after $retry_count attempts"
                         exit 1
                       fi
                       sleep 60
                       ;;
                     500|502|503)
-                      echo "[ERROR] Docker Hub server error (HTTP $http_code). Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                      echo "Docker Hub server error (HTTP $http_code). Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
                       ((retry_count++))
                       if ((retry_count >= max_retries)); then
-                        echo "[ERROR] Server error after $retry_count attempts."
+                        echo "Server error after $retry_count attempts"
                         exit 1
                       fi
                       sleep 10
                       ;;
                     *)
-                      echo "[ERROR] Unexpected HTTP status (HTTP $http_code)."
+                      echo "Unexpected HTTP status (HTTP $http_code)."
                       exit 1
                       ;;
                   esac
                 else
-                  echo "[ERROR] Network or curl failure. Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                  echo "Network or curl failure. Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
                   ((retry_count++))
                   if ((retry_count >= max_retries)); then
-                    echo "[ERROR] Network or curl failure after $retry_count attempts."
+                    echo "Network or curl failure after $retry_count attempts"
                     exit 1
                   fi
                   sleep 10
@@ -1067,7 +970,7 @@ jobs:
             new_latest_digest=$(echo "$DH_VERSIONS_JSON" | jq -r --arg tag "$new_latest_tag" '.[] | select(.name == $tag) | .digest')
 
             if [[ -z "$new_latest_digest" ]]; then
-              echo "[ERROR] Could not find digest for new latest tag: $new_latest_tag"
+              echo "Could not find digest for new latest tag: $new_latest_tag"
               exit 1
             fi
             echo "Re-tagging $new_latest_tag (digest: $new_latest_digest) as 'latest'..."
@@ -1089,50 +992,46 @@ jobs:
                     break
                     ;;
                   401|403)
-                    echo "[ERROR] Unauthorized or forbidden (HTTP $response). Check your Docker Hub credentials and permissions."
-                    exit 1
-                    ;;
-                  404)
-                    echo "[ERROR] Repository or digest does NOT exist (HTTP 404)."
+                    echo "Unauthorized or forbidden (HTTP $response). Check your Docker Hub credentials and permissions."
                     exit 1
                     ;;
                   409)
-                    echo "[ERROR] Conflict (HTTP 409). The resource may be in use or locked. Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                    echo "Conflict (HTTP 409). The resource may be in use or locked. Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
                     ((retry_count++))
                     if ((retry_count >= max_retries)); then
-                      echo "[ERROR] Conflict (HTTP 409) after $retry_count attempts. Giving up."
+                      echo "Conflict (HTTP 409) after $retry_count attempts Giving up."
                       exit 1
                     fi
                     sleep 10
                     ;;
                   429)
-                    echo "[ERROR] Rate limit exceeded (HTTP 429). Retrying in 60 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                    echo "Rate limit exceeded (HTTP 429). Retrying in 60 seconds... (attempt $((retry_count + 1))/$max_retries)"
                     ((retry_count++))
                     if ((retry_count >= max_retries)); then
-                      echo "[ERROR] Rate limit exceeded after $retry_count attempts."
+                      echo "Rate limit exceeded after $retry_count attempts"
                       exit 1
                     fi
                     sleep 60
                     ;;
                   500|502|503)
-                    echo "[ERROR] Docker Hub server error (HTTP $response). Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                    echo "Docker Hub server error (HTTP $response). Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
                     ((retry_count++))
                     if ((retry_count >= max_retries)); then
-                      echo "[ERROR] Server error after $retry_count attempts."
+                      echo "Server error after $retry_count attempts"
                       exit 1
                     fi
                     sleep 10
                     ;;
                   *)
-                    echo "[ERROR] Unexpected HTTP status (HTTP $response)."
+                    echo "Unexpected HTTP status (HTTP $response)."
                     exit 1
                     ;;
                 esac
               else
-                echo "[ERROR] Network or curl failure. Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
+                echo "Network or curl failure. Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
                 ((retry_count++))
                 if ((retry_count >= max_retries)); then
-                  echo "[ERROR] Network or curl failure after $retry_count attempts."
+                  echo "Network or curl failure after $retry_count attempts"
                   exit 1
                 fi
                 sleep 10
@@ -1174,7 +1073,7 @@ jobs:
 
             echo "[INFO] Building multi-arch image for tag: $tag"
             if ! git switch --detach "$tag"; then
-              echo "[ERROR] Failed to switch to tag: $tag"
+              echo "Failed to switch to tag: $tag"
               git switch --detach "$original_state"
               exit 1
             fi
@@ -1227,103 +1126,11 @@ jobs:
             # Execute build
             echo "[INFO] Building and pushing multi-arch image: Tag \"$tag\" | Platforms: [$platforms] → Docker Hub"
             if ! docker buildx build "${build_args[@]}" .; then
-              echo "[ERROR] Failed to build/push for tag: $tag"
+              echo "Failed to build/push for tag: $tag"
               git switch --detach "$original_state"
               exit 1
             fi
 
             echo "[SUCCESS] Built and pushed multi-arch image for tag: $tag"
             git switch --detach "$original_state"
-
-            # Initialize Docker Hub repository
-            if [[ "${{ needs.pre-build.outputs.dh_repo_exists }}" == "false" ]]; then
-              echo "Setting Docker Hub repository description..."
-
-              max_retries=5
-              retry_count=0
-              while true; do
-                set +e
-                http_code=$(curl -sL -w "%{http_code}" -u "$DH_OWNER:$DH_PAT" \
-                  "https://hub.docker.com/v2/repositories/$DH_OWNER/$ORIGIN_REPO_NAME/")
-                curl_exit=$?
-                set -e
-                if [[ $curl_exit -eq 0 ]]; then
-                  case "$http_code" in
-                    200)
-                      echo "Docker Hub repository is available."
-                      break
-                      ;;
-                    404)
-                      echo "[ERROR] Docker Hub repository does NOT exist yet (HTTP 404). Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
-                      ((retry_count++))
-                      if ((retry_count >= max_retries)); then
-                        echo "[ERROR] Docker Hub repository does NOT exist after $retry_count attempts (HTTP 404)."
-                        exit 1
-                      fi
-                      sleep 10
-                      ;;
-                    429)
-                      echo "[ERROR] Rate limit exceeded (HTTP 429). Retrying in 60 seconds... (attempt $((retry_count + 1))/$max_retries)"
-                      ((retry_count++))
-                      if ((retry_count >= max_retries)); then
-                        echo "[ERROR] Rate limit exceeded after $retry_count attempts."
-                        exit 1
-                      fi
-                      sleep 60
-                      ;;
-                    500|502|503)
-                      echo "[ERROR] Docker Hub server error (HTTP $http_code). Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
-                      ((retry_count++))
-                      if ((retry_count >= max_retries)); then
-                        echo "[ERROR] Server error after $retry_count attempts."
-                        exit 1
-                      fi
-                      sleep 10
-                      ;;
-                    *)
-                      echo "[ERROR] Unexpected HTTP status (HTTP $http_code)"
-                      exit 1
-                      ;;
-                  esac
-                else
-                  echo "[ERROR] Network or curl failure. Retrying in 10 seconds... (attempt $((retry_count + 1))/$max_retries)"
-                  ((retry_count++))
-                  if ((retry_count >= max_retries)); then
-                    echo "[ERROR] Network or curl failure after $retry_count attempts."
-                    exit 1
-                  fi
-                  sleep 10
-                fi
-              done
-
-              full_description=$(jq -Rs . < README.md)
-              if [[ -z "$full_description" || "$full_description" == "\"\"" ]]; then
-                # PATCH without full_description
-                if ! curl -X PATCH \
-                  -H "Content-Type: application/json" \
-                  -u "$DH_OWNER:$DH_PAT" \
-                  -d "{
-                    \"description\": \"Docker image built from $ORIGIN_SERVER_URL/$ORIGIN_REPO_FULL\"
-                  }" \
-                  "https://hub.docker.com/v2/repositories/$DH_OWNER/$ORIGIN_REPO_NAME/"; then
-                  echo "[ERROR] Failed to update Docker Hub repository description."
-                  exit 1
-                fi
-              else
-                # PATCH with full_description
-                if ! curl -X PATCH \
-                  -H "Content-Type: application/json" \
-                  -u "$DH_OWNER:$DH_PAT" \
-                  -d "{
-                    \"description\": \"Docker image built from $ORIGIN_SERVER_URL/$ORIGIN_REPO_FULL\",
-                    \"full_description\": $full_description
-                  }" \
-                  "https://hub.docker.com/v2/repositories/$DH_OWNER/$ORIGIN_REPO_NAME/"; then
-                  echo "[ERROR] Failed to update Docker Hub repository description."
-                  exit 1
-                fi
-              fi
-              echo "[SUCCESS] Docker Hub repository description updated"
-            fi
-          done
         shell: bash
